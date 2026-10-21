@@ -5,32 +5,26 @@ import 'package:flutter/material.dart';
 
 import 'scanner.dart';
 
-/// 검출된 윤곽(모서리 + 굴곡)을 손으로 조정하고, 색 처리 방식을 고른 뒤 페이지를 완성하는 화면.
-/// 결과: 완성된 페이지 JPG 목록 (양면이면 2장).
+/// 사진 자르기: 자동 인식된 윤곽(모서리 + 굴곡)을 손으로 고치는 화면 (선택 기능).
+/// 결과: 고친 윤곽.
 class CropScreen extends StatefulWidget {
-  const CropScreen({super.key, required this.detection});
+  const CropScreen({super.key, required this.detection, this.initial});
 
   final Detection detection;
+  final PageShape? initial;
 
   @override
   State<CropScreen> createState() => _CropScreenState();
 }
 
 class _CropScreenState extends State<CropScreen> {
-  late PageShape _shape = widget.detection.shape.copy();
-  ScanMode _mode = ScanMode.enhanced;
+  late PageShape _shape = (widget.initial ?? widget.detection.shape).copy();
   int? _dragging; // 0~4: 위 가장자리, 5~9: 아래 가장자리
-  bool _busy = false;
 
   Offset _point(int i) => i < 5 ? _shape.top[i] : _shape.bottom[i - 5];
 
   void _setPoint(int i, Offset p) => i < 5 ? _shape.top[i] = p : _shape.bottom[i - 5] = p;
 
-  Future<void> _done() async {
-    setState(() => _busy = true);
-    final out = await compute(warpPage, (widget.detection.jpg, _shape, _mode));
-    if (mounted) Navigator.pop<List<Uint8List>>(context, out);
-  }
 
   /// 굴곡을 없애고 네 모서리 사이를 곧은 선으로
   void _straighten() => setState(() => _shape = PageShape.quad(
@@ -42,7 +36,7 @@ class _CropScreenState extends State<CropScreen> {
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
-        title: Text(d.found ? '윤곽 확인' : '모서리를 맞춰 주세요'),
+        title: const Text('사진 자르기'),
         actions: [
           IconButton(
             tooltip: '곧게 (굴곡 없애기)',
@@ -141,35 +135,15 @@ class _CropScreenState extends State<CropScreen> {
                   style: const TextStyle(color: Colors.white60, fontSize: 12)),
             ]),
           ),
-          SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            child: Row(
-              children: [
-                for (final m in ScanMode.values)
-                  Padding(
-                    padding: const EdgeInsets.all(4),
-                    child: ChoiceChip(
-                      label: Text(scanModeLabels[m]!),
-                      selected: _mode == m,
-                      onSelected: (_) => setState(() => _mode = m),
-                    ),
-                  ),
-              ],
-            ),
-          ),
           Padding(
-            padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
+            padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
             child: SizedBox(
               width: double.infinity,
               height: 52,
               child: FilledButton.icon(
-                onPressed: _busy ? null : _done,
-                icon: _busy
-                    ? const SizedBox(
-                        width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
-                    : const Icon(Icons.check),
-                label: Text(_shape.spread ? '펴서 2페이지 추가' : '펴서 페이지 추가'),
+                onPressed: () => Navigator.pop(context, _shape),
+                icon: const Icon(Icons.check),
+                label: const Text('적용'),
               ),
             ),
           ),

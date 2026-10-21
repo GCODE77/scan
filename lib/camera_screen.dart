@@ -1,7 +1,14 @@
+import 'dart:io';
+
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
-/// 촬영 화면. 셔터를 누르면 찍은 사진 경로를 돌려준다.
+import 'ocr.dart';
+import 'scanner.dart';
+
+/// 연속 촬영 화면. 셔터를 누를 때마다 뒤에서 페이지를 자동 인식·펴기 한다.
+/// '완료'를 누르면 만들어진 페이지 목록을 돌려준다.
 class CameraScreen extends StatefulWidget {
   const CameraScreen({super.key});
 
@@ -12,8 +19,11 @@ class CameraScreen extends StatefulWidget {
 class _CameraScreenState extends State<CameraScreen> {
   CameraController? _controller;
   String? _error;
-  bool _busy = false;
   bool _flash = false;
+  bool _flashEffect = false;
+  final List<ScanPage> _pages = [];
+  int _processing = 0;
+  Future<void> _queue = Future.value();
 
   @override
   void initState() {
@@ -46,14 +56,32 @@ class _CameraScreenState extends State<CameraScreen> {
 
   Future<void> _shoot() async {
     final c = _controller;
-    if (c == null || _busy) return;
-    setState(() => _busy = true);
-    try {
-      final file = await c.takePicture();
-      if (mounted) Navigator.pop(context, file.path);
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
+    if (c == null || c.value.isTakingPicture) return;
+    final file = await c.takePicture();
+    setState(() {
+      _processing++;
+      _flashEffect = true;
+    });
+    Future.delayed(const Duration(milliseconds: 120), () {
+      if (mounted) setState(() => _flashEffect = false);
+    });
+    // 촬영은 바로 다음 장으로, 인식·펴기는 순서대로 뒤에서
+    _queue = _queue.then((_) async {
+      try {
+        final (det, flats) = await compute(autoScan, file.path);
+        for (var i = 0; i < flats.length; i++) {
+          _pages.add(ScanPage(det: det, shape: det.shape, part: i, flat: flats[i]));
+        }
+      } finally {
+        File(file.path).delete().ignore();
+        if (mounted) setState(() => _processing--);
+      }
+    });
+  }
+
+  Future<void> _finish() async {
+    if (_processing > 0) await _queue;
+    if (mounted) Navigator.pop(context, _pages);
   }
 
   Future<void> _toggleFlash() async {
@@ -65,11 +93,23 @@ class _CameraScreenState extends State<CameraScreen> {
   @override
   Widget build(BuildContext context) {
     final c = _controller;
+    final count = _pages.length;
     return Scaffold(
       backgroundColor: Colors.black,
       body: SafeArea(
         child: Column(
           children: [
+            Row(children: [
+              IconButton(
+                icon: const Icon(Icons.close, color: Colors.white),
+                onPressed: () => Navigator.pop(context),
+              ),
+              const Spacer(),
+              IconButton(
+                icon: Icon(_flash ? Icons.flash_on : Icons.flash_off, color: Colors.white),
+                onPressed: _toggleFlash,
+              ),
+            ]),
             Expanded(
               child: Center(
                 child: _error != null
@@ -80,20 +120,59 @@ class _CameraScreenState extends State<CameraScreen> {
                             aspectRatio: 1 / c.value.aspectRatio,
                             child: Stack(fit: StackFit.expand, children: [
                               CameraPreview(c),
-                              const _Guide(),
+                              AnimatedOpacity(
+                                opacity: _flashEffect ? 0.7 : 0,
+                                duration: const Duration(milliseconds: 100),
+                                child: const ColoredBox(color: Colors.white),
+                              ),
                             ]),
                           ),
               ),
             ),
+            const Padding(
+              padding: EdgeInsets.only(top: 8),
+              child: Text('책을 화면에 담고 셔터만 누르세요 · 자동으로 인식합니다',
+                  style: TextStyle(color: Colors.white70, fontSize: 12)),
+            ),
             Padding(
-              padding: const EdgeInsets.symmetric(vertical: 20),
+              padding: const EdgeInsets.symmetric(vertical: 18, horizontal: 20),
               child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                 children: [
-                  IconButton(
-                    icon: const Icon(Icons.close, color: Colors.white, size: 30),
-                    onPressed: () => Navigator.pop(context),
+                  // 마지막 페이지 썸네일 + 장 수
+                  SizedBox(
+                    width: 64,
+                    height: 64,
+                    child: count == 0 && _processing == 0
+                        ? null
+                        : Stack(clipBehavior: Clip.none, children: [
+                            Positioned.fill(
+                              child: Container(
+                                decoration: BoxDecoration(border: Border.all(color: Colors.white, width: 2)),
+                                child: count == 0
+                                    ? null
+                                    : Image.memory(_pages.last.jpg, fit: BoxFit.cover, cacheWidth: 150),
+                              ),
+                            ),
+                            if (_processing > 0)
+                              const Positioned.fill(
+                                  child: Center(
+                                      child: SizedBox(
+                                          width: 24,
+                                          height: 24,
+                                          child: CircularProgressIndicator(strokeWidth: 2.5)))),
+                            if (count > 0)
+                              Positioned(
+                                right: -8,
+                                top: -8,
+                                child: CircleAvatar(
+                                    radius: 12,
+                                    backgroundColor: Colors.teal,
+                                    child: Text('$count',
+                                        style: const TextStyle(fontSize: 12, color: Colors.white))),
+                              ),
+                          ]),
                   ),
+                  const Spacer(),
                   GestureDetector(
                     onTap: _shoot,
                     child: Container(
@@ -102,37 +181,26 @@ class _CameraScreenState extends State<CameraScreen> {
                       decoration: BoxDecoration(
                         shape: BoxShape.circle,
                         border: Border.all(color: Colors.white, width: 5),
-                        color: _busy ? Colors.grey : Colors.white24,
+                        color: Colors.white24,
                       ),
                     ),
                   ),
-                  IconButton(
-                    icon: Icon(_flash ? Icons.flash_on : Icons.flash_off,
-                        color: Colors.white, size: 30),
-                    onPressed: _toggleFlash,
+                  const Spacer(),
+                  SizedBox(
+                    width: 64,
+                    child: count + _processing == 0
+                        ? null
+                        : FilledButton(
+                            style: FilledButton.styleFrom(
+                                backgroundColor: Colors.teal, padding: EdgeInsets.zero),
+                            onPressed: _finish,
+                            child: const Icon(Icons.check),
+                          ),
                   ),
                 ],
               ),
             ),
           ],
-        ),
-      ),
-    );
-  }
-}
-
-/// 페이지를 화면 안에 맞추도록 돕는 안내선.
-class _Guide extends StatelessWidget {
-  const _Guide();
-
-  @override
-  Widget build(BuildContext context) {
-    return IgnorePointer(
-      child: Container(
-        margin: const EdgeInsets.all(24),
-        decoration: BoxDecoration(
-          border: Border.all(color: Colors.white38, width: 1.5),
-          borderRadius: BorderRadius.circular(8),
         ),
       ),
     );

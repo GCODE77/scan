@@ -37,14 +37,15 @@ class Detection {
   final bool found;
 }
 
-/// 보정 후 색 처리 방식.
-enum ScanMode { original, enhanced, gray, bw }
+/// 필터 (색 처리 방식). 기본은 원본.
+enum ScanMode { original, bright, magic, gray, bw }
 
 const scanModeLabels = {
   ScanMode.original: '원본',
-  ScanMode.enhanced: '선명하게',
+  ScanMode.bright: '밝게하기',
+  ScanMode.magic: '매직 컬러',
   ScanMode.gray: '흑백',
-  ScanMode.bw: '스캔(B/W)',
+  ScanMode.bw: '스캔 B/W',
 };
 
 // ───────────────────────── 검출 ─────────────────────────
@@ -62,13 +63,9 @@ Future<Detection> detectPage(String path) async {
   final quad = _findQuad(gray);
 
   if (quad == null) {
-    final c = [
-      Offset(w * .05, h * .05),
-      Offset(w * .95, h * .05),
-      Offset(w * .95, h * .95),
-      Offset(w * .05, h * .95),
-    ];
-    return Detection(jpg, w, h, PageShape.quad(c, w > h * 1.15), false);
+    // 못 찾으면 사진 전체를 페이지로 (사용자가 원하면 나중에 자르기로 조정)
+    final c = [Offset.zero, Offset(w - 1.0, 0), Offset(w - 1.0, h - 1.0), Offset(0, h - 1.0)];
+    return Detection(jpg, w, h, PageShape.quad(c, false), false);
   }
 
   final img2 = _Gray(gray);
@@ -269,22 +266,24 @@ cv.Mat _dewarp(cv.Mat img, List<Offset> top, List<Offset> bottom) {
 /// 색 처리.
 cv.Mat _applyMode(cv.Mat out, ScanMode mode) {
   if (mode == ScanMode.original) return out;
+  if (mode == ScanMode.bright) return out.convertTo(cv.MatType.CV_8UC3, alpha: 1.15, beta: 25);
   // 배경(종이) 밝기를 추정해서 나누면 그림자와 조명 얼룩이 사라진다
   final gray = cv.cvtColor(out, cv.COLOR_BGR2GRAY);
   final k = cv.getStructuringElement(cv.MORPH_RECT, (7, 7));
   final bg = cv.medianBlur(cv.dilate(gray, k), 21);
   return switch (mode) {
-    ScanMode.enhanced => cv.divide(out, cv.cvtColor(bg, cv.COLOR_GRAY2BGR), scale: 255),
+    ScanMode.magic => cv.divide(out, cv.cvtColor(bg, cv.COLOR_GRAY2BGR), scale: 255),
     ScanMode.gray => cv.divide(gray, bg, scale: 255),
     ScanMode.bw => cv.adaptiveThreshold(cv.divide(gray, bg, scale: 255), 255,
         cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, 31, 10),
-    ScanMode.original => out,
+    ScanMode.original || ScanMode.bright => out,
   };
 }
 
-/// isolate에서 실행된다: 윤곽대로 펴고 색 처리 → JPG 목록 (양면이면 왼쪽, 오른쪽 2장).
-Future<List<Uint8List>> warpPage((Uint8List, PageShape, ScanMode) args) async {
-  final (jpg, shape, mode) = args;
+/// isolate에서 실행된다: 윤곽대로 편 원본 색 JPG 목록 (양면이면 왼쪽, 오른쪽 2장).
+/// 필터와 회전은 이 결과 위에 [renderPage]로 따로 입힌다.
+Future<List<Uint8List>> warpFlat((Uint8List, PageShape) args) async {
+  final (jpg, shape) = args;
   final img = cv.imdecode(jpg, cv.IMREAD_COLOR);
   final top = sampleCurve(shape.top), bottom = sampleCurve(shape.bottom);
 
@@ -295,9 +294,30 @@ Future<List<Uint8List>> warpPage((Uint8List, PageShape, ScanMode) args) async {
         ]
       : [(top, bottom)];
 
-  return [
-    for (final (t, b) in parts)
-      cv.imencode('.jpg', _applyMode(_dewarp(img, t, b), mode),
-          params: cv.VecI32.fromList([cv.IMWRITE_JPEG_QUALITY, 92])).$2,
-  ];
+  return [for (final (t, b) in parts) _encode(_dewarp(img, t, b))];
 }
+
+/// isolate에서 실행된다: 편 이미지에 필터·회전 적용. maxSide를 주면 미리보기용으로 작게.
+Future<Uint8List> renderPage((Uint8List, ScanMode, int, int?) args) async {
+  final (flat, mode, quarterTurns, maxSide) = args;
+  var img = cv.imdecode(flat, cv.IMREAD_COLOR);
+  if (maxSide != null) {
+    final s = maxSide / math.max(img.cols, img.rows);
+    if (s < 1) img = cv.resize(img, ((img.cols * s).round(), (img.rows * s).round()), interpolation: cv.INTER_AREA);
+  }
+  img = _applyMode(img, mode);
+  final r = quarterTurns % 4;
+  if (r != 0) {
+    img = cv.rotate(img, const [0, cv.ROTATE_90_CLOCKWISE, cv.ROTATE_180, cv.ROTATE_90_COUNTERCLOCKWISE][r]);
+  }
+  return _encode(img);
+}
+
+/// isolate에서 실행된다: 촬영 직후 자동 처리 (검출 → 펴기). 결과는 (검출, 편 이미지들).
+Future<(Detection, List<Uint8List>)> autoScan(String path) async {
+  final det = await detectPage(path);
+  return (det, await warpFlat((det.jpg, det.shape)));
+}
+
+Uint8List _encode(cv.Mat m) =>
+    cv.imencode('.jpg', m, params: cv.VecI32.fromList([cv.IMWRITE_JPEG_QUALITY, 92])).$2;
