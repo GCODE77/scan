@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' show Offset;
@@ -29,10 +30,25 @@ class PageShape {
 
 /// 촬영 사진을 읽고 페이지 윤곽을 찾은 결과.
 class Detection {
-  Detection(this.jpg, this.width, this.height, this.shape, this.found);
+  Detection(Uint8List jpg, this.width, this.height, this.shape, this.found) : _mem = jpg;
+
+  /// 보관함에서 불러온 것: 원본 사진은 필요할 때만 파일에서 읽는다 (메모리 절약)
+  Detection.stored(String this.path, this.width, this.height, this.shape) : found = true;
+
+  Uint8List? _mem;
+
+  /// 보관함에 저장된 원본 사진 경로 (저장 전이면 null)
+  String? path;
 
   /// EXIF 회전이 적용된 원본 (화면 표시와 보정에 공통 사용)
-  final Uint8List jpg;
+  Uint8List get jpg => _mem ?? File(path!).readAsBytesSync();
+
+  /// 파일로 저장한 뒤에는 메모리에서 내린다
+  void storedAt(String p) {
+    path = p;
+    _mem = null;
+  }
+
   final int width;
   final int height;
   final PageShape shape;

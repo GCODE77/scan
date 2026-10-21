@@ -19,6 +19,7 @@ class CropScreen extends StatefulWidget {
 
 class _CropScreenState extends State<CropScreen> {
   late PageShape _shape = (widget.initial ?? widget.detection.shape).copy();
+  late final Uint8List _jpg = widget.detection.jpg;
   int? _dragging; // 0~kPts-1: 위 가장자리, 그 다음: 아래 가장자리
 
   Offset _point(int i) => i < kPts ? _shape.top[i] : _shape.bottom[i - kPts];
@@ -103,7 +104,7 @@ class _CropScreenState extends State<CropScreen> {
                       top: oy,
                       width: d.width * s,
                       height: d.height * s,
-                      child: Image.memory(d.jpg, fit: BoxFit.fill, gaplessPlayback: true),
+                      child: Image.memory(_jpg, fit: BoxFit.fill, gaplessPlayback: true),
                     ),
                     Positioned.fill(
                       child: CustomPaint(
@@ -111,7 +112,7 @@ class _CropScreenState extends State<CropScreen> {
                     ),
                     if (_dragging != null)
                       _Magnifier(
-                          image: d.jpg, d: d, at: _point(_dragging!), screen: handles[_dragging!], box: box),
+                          image: _jpg, d: d, at: _point(_dragging!), screen: handles[_dragging!], box: box),
                   ]),
                 );
               }),

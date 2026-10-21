@@ -45,11 +45,10 @@ class SaveOptions {
 
 /// 저장 옵션 시트. 고른 옵션과 저장 방법을 돌려준다.
 Future<(SaveOptions, SaveTarget)?> showSaveSheet(
-    BuildContext context, int total, int selected) {
-  final now = DateTime.now();
-  String two(int v) => v.toString().padLeft(2, '0');
+    BuildContext context, int total, int selected, String docName) {
   final o = SaveOptions()
-    ..name = '스캔_${now.year}${two(now.month)}${two(now.day)}_${two(now.hour)}${two(now.minute)}'
+    // 파일 이름에 쓸 수 없는 글자는 바꾼다
+    ..name = docName.replaceAll(RegExp(r'[\/:*?"<>|]'), '-').replaceAll(' ', '_')
     ..onlySelected = selected > 0;
   final nameCtl = TextEditingController(text: o.name);
 

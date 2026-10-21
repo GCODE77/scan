@@ -27,8 +27,12 @@ class OcrResult {
 /// 스캔된 페이지 한 장.
 /// [flat]은 편 원본, [jpg]는 필터·회전을 입힌 최종 결과.
 class ScanPage {
-  ScanPage({required this.det, required this.shape, required this.part, required this.flat})
-      : jpg = flat;
+  ScanPage({required this.det, required this.shape, required this.part, required this.flat, String? id})
+      : jpg = flat,
+        id = id ?? newId();
+
+  /// 보관함 파일 이름에 쓰는 고유 번호
+  final String id;
 
   /// 촬영 원본과 검출 결과 (자르기 화면에서 다시 쓴다)
   final Detection det;
@@ -50,6 +54,10 @@ class ScanPage {
     ocr = null;
   }
 }
+
+var _idSeq = 0;
+
+String newId() => '${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}${(_idSeq++).toRadixString(36)}';
 
 /// 한국어 인식기. 한글과 영어(라틴 문자)를 함께 읽는다. 모든 처리는 휴대폰 안에서.
 class Ocr {
