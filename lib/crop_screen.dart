@@ -24,8 +24,51 @@ class _CropScreenState extends State<CropScreen> {
 
   Offset _point(int i) => i < kPts ? _shape.top[i] : _shape.bottom[i - kPts];
 
-  void _setPoint(int i, Offset p) =>
-      i < kPts ? _shape.top[i] = p : _shape.bottom[i - kPts] = p;
+  /// 손으로 잡을 수 있는 점: 모서리 4개 + 위·아래 가운데 2개 (나머지 점은 자동으로 따라온다)
+  static const _visible = {0, kMid, kPts - 1, kPts, kPts + kMid, 2 * kPts - 1};
+
+  /// 점 하나를 옮기면 그 변 전체를 자연스럽게 다시 그린다.
+  /// - 모서리·제본선: 변의 굴곡 모양은 유지한 채 따라 움직임
+  /// - 가운데 점(한 장): 변 전체가 부드러운 곡선(포물선)으로 휨
+  void _setPoint(int i, Offset p) {
+    final edge = i < kPts ? _shape.top : _shape.bottom;
+    final k = i < kPts ? i : i - kPts;
+    if (k == kMid && !_shape.spread) {
+      final a = edge.first, b = edge.last;
+      final c = p * 2 - (a + b) / 2; // 가운데를 지나는 2차 곡선의 조절점
+      for (var j = 1; j < kPts - 1; j++) {
+        final t = j / (kPts - 1);
+        edge[j] = a * ((1 - t) * (1 - t)) + c * (2 * t * (1 - t)) + b * (t * t);
+      }
+      return;
+    }
+    // 이 점이 끝인 구간들만 모양을 유지한 채 다시 맞춘다
+    final anchors = _shape.spread ? [0, kMid, kPts - 1] : [0, kPts - 1];
+    for (var s = 0; s < anchors.length - 1; s++) {
+      final i0 = anchors[s], i1 = anchors[s + 1];
+      if (k != i0 && k != i1) continue;
+      _reanchor(edge, i0, i1, k == i0 ? p : edge[i0], k == i1 ? p : edge[i1]);
+    }
+    edge[k] = p;
+  }
+
+  /// edge[i0..i1] 사이 점들을, 양 끝이 newA·newB로 옮겨질 때 같은 굴곡 모양으로 따라오게 한다.
+  static void _reanchor(List<Offset> edge, int i0, int i1, Offset newA, Offset newB) {
+    final oa = edge[i0], ob = edge[i1];
+    final od = ob - oa, nd = newB - newA;
+    final ol = od.distance, nl = nd.distance;
+    if (ol < 1e-6 || nl < 1e-6) return;
+    final oDir = od / ol, oNrm = Offset(-oDir.dy, oDir.dx);
+    final nDir = nd / nl, nNrm = Offset(-nDir.dy, nDir.dx);
+    final sc = nl / ol;
+    for (var j = i0 + 1; j < i1; j++) {
+      final t = (j - i0) / (i1 - i0);
+      final rel = edge[j] - Offset.lerp(oa, ob, t)!;
+      final along = rel.dx * oDir.dx + rel.dy * oDir.dy;
+      final across = rel.dx * oNrm.dx + rel.dy * oNrm.dy;
+      edge[j] = Offset.lerp(newA, newB, t)! + nDir * (along * sc) + nNrm * (across * sc);
+    }
+  }
 
 
   /// 굴곡을 없애고 네 모서리 사이를 곧은 선으로
@@ -41,7 +84,8 @@ class _CropScreenState extends State<CropScreen> {
         backgroundColor: Colors.black,
         title: const Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Text('윤곽 수정'),
-          Text('점을 끌어서 종이 끝에 맞추세요', style: TextStyle(fontSize: 12, color: Colors.white60)),
+          Text('모서리 4개 · 가운데 점은 끌면 굴곡이 한 번에 휩니다',
+              style: TextStyle(fontSize: 12, color: Colors.white60)),
         ]),
       ),
       body: Column(
@@ -65,14 +109,14 @@ class _CropScreenState extends State<CropScreen> {
                 return GestureDetector(
                   onPanStart: (e) {
                     // 손가락에서 가장 가까운 조절점을 잡는다
-                    var best = 0;
-                    for (var i = 1; i < handles.length; i++) {
-                      if ((handles[i] - e.localPosition).distance <
-                          (handles[best] - e.localPosition).distance) {
+                    int? best;
+                    for (final i in _visible) {
+                      if (best == null ||
+                          (handles[i] - e.localPosition).distance < (handles[best] - e.localPosition).distance) {
                         best = i;
                       }
                     }
-                    if ((handles[best] - e.localPosition).distance < 50) _dragging = best;
+                    if (best != null && (handles[best] - e.localPosition).distance < 56) _dragging = best;
                   },
                   onPanUpdate: (e) {
                     final i = _dragging;
@@ -180,9 +224,11 @@ class _ShapePainter extends CustomPainter {
     }
     final pts = [...top, ...bottom];
     for (var i = 0; i < pts.length; i++) {
+      // 잡을 수 있는 점만 그린다 (모서리 4개 + 가운데 2개)
+      if (!_CropScreenState._visible.contains(i)) continue;
       final corner = i == 0 || i == kPts - 1 || i == kPts || i == 2 * kPts - 1;
       final spine = spread && (i == kMid || i == kPts + kMid);
-      final r = i == active ? 15.0 : (corner ? 12.0 : 9.0);
+      final r = i == active ? 17.0 : (corner ? 13.0 : 11.0);
       canvas.drawCircle(pts[i], r, Paint()..color = Colors.white);
       canvas.drawCircle(
           pts[i],

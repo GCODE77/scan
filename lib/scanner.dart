@@ -71,6 +71,17 @@ const scanModeLabels = {
 // ───────────────────────── 검출 ─────────────────────────
 
 /// isolate에서 실행된다: 사진 경로 → 페이지 윤곽(모서리 + 굴곡) 검출.
+/// 곡선이 양 끝을 잇는 직선에서 가장 멀리 벗어난 정도 (직선 길이 대비)
+double _bend(List<Offset> pts) {
+  final a = pts.first, b = pts.last, d = b - a, len = d.distance;
+  if (len == 0) return 0;
+  var m = 0.0;
+  for (final p in pts) {
+    m = math.max(m, ((p - a).dx * d.dy - (p - a).dy * d.dx).abs() / len);
+  }
+  return m / len;
+}
+
 /// 고해상도(긴 변 1600) 밝기 경사. 모서리 정밀 보정용.
 class _Grad {
   _Grad(cv.Mat img, double s800) {
@@ -250,9 +261,19 @@ PageShape _shapeFor(cv.Mat blur, cv.Mat inkAll, cv.Mat blob, List<Offset> quad0,
 
   // 3) 굴곡: 페이지 안 글자 줄의 휜 모양 (없으면 종이 가장자리를 따라감)
   final lines = _TextLines(inkM);
+  (List<Offset>, List<Offset>) straight(Offset tl, Offset tr, Offset br, Offset bl, int n) => (
+        [for (var i = 0; i < n; i++) Offset.lerp(tl, tr, i / (n - 1))!],
+        [for (var i = 0; i < n; i++) Offset.lerp(bl, br, i / (n - 1))!],
+      );
   (List<Offset>, List<Offset>) curves(Offset tl, Offset tr, Offset br, Offset bl, int n) {
     final byText = lines.edges(tl, tr, br, bl, n);
-    if (byText != null) return byText;
+    if (byText != null) {
+      // 거의 안 휘었으면 평평한 종이: 정확한 네 모서리로 반듯하게 (글자 줄 위치보다 모서리가 더 정확)
+      if (_bend(byText.$1) < 0.015 && _bend(byText.$2) < 0.015) return straight(tl, tr, br, bl, n);
+      return byText;
+    }
+    // 글자 줄이 없을 때 가장자리를 따라 휘게 만드는 것은 책일 때만 (평평한 종이는 액자·그림자에 속기 쉽다)
+    if (spine == null) return straight(tl, tr, br, bl, n);
     final center = (tl + tr + br + bl) / 4;
     final pageH = ((bl - tl).distance + (br - tr).distance) / 2;
     return (
