@@ -996,3 +996,50 @@ Future<Uint8List> transcode((Uint8List, String, int?, int) args) async {
       ? cv.imencode('.png', img).$2
       : cv.imencode('.jpg', img, params: cv.VecI32.fromList([cv.IMWRITE_JPEG_QUALITY, quality])).$2;
 }
+
+/// isolate에서 실행된다: 사용자가 놓은 모서리를 근처의 실제 종이 모서리에 붙인다.
+/// (원본 JPG, 네 모서리 [좌상·우상·우하·좌하] 원본 좌표, 옮긴 모서리 번호) → 붙을 위치 (못 찾으면 null)
+Future<Offset?> snapCorner((Uint8List, List<Offset>, int) args) async {
+  final (jpg, quad, idx) = args;
+  final img = cv.imdecode(jpg, cv.IMREAD_COLOR);
+  if (img.isEmpty) return null;
+  final g = _Grad(img, 1.0); // f = 1600 배율 (원본 → 고해상도)
+  final q = [for (final p in quad) p * g.s];
+  final c = q[idx];
+  final center = q.reduce((a, b) => a + b) / 4;
+  final diag = ((q[2] - q[0]).distance + (q[3] - q[1]).distance) / 2;
+
+  // 이 모서리에서 뻗은 두 변을 모서리 가까운 쪽만 보고 다시 맞춘다
+  (Offset, Offset)? edgeNear(Offset other) {
+    final d = other - c, len = d.distance;
+    if (len < 10) return null;
+    final t = d / len;
+    var n = Offset(-t.dy, t.dx);
+    final mid = c + d * 0.25;
+    if ((center - mid).dx * n.dx + (center - mid).dy * n.dy < 0) n = -n;
+    final band = math.max(10, (diag * 0.05).round()); // 대충 놓아도 찾도록 넉넉히
+    final pts = <Offset>[];
+    for (var k = 0; k < 30; k++) {
+      final p = c + d * (0.04 + 0.4 * k / 29);
+      Offset? best;
+      var bv = 30.0;
+      for (var j = -band; j <= band; j++) {
+        final x = (p.dx + n.dx * j).round(), y = (p.dy + n.dy * j).round();
+        if (x < 1 || y < 1 || x >= g.w - 1 || y >= g.h - 1) continue;
+        final v = g.gx[y * g.w + x] * n.dx + g.gy[y * g.w + x] * n.dy; // 안쪽이 밝아지는 경계
+        if (v > bv) {
+          bv = v;
+          best = Offset(x.toDouble(), y.toDouble());
+        }
+      }
+      if (best != null) pts.add(best);
+    }
+    return pts.length < 8 ? null : _fitLine(pts);
+  }
+
+  final l1 = edgeNear(q[(idx + 3) % 4]), l2 = edgeNear(q[(idx + 1) % 4]);
+  if (l1 == null || l2 == null) return null;
+  final p = _intersect(l1, l2);
+  if (p == null || (p - c).distance > diag * 0.08) return null;
+  return p / g.s;
+}

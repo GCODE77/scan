@@ -2,6 +2,7 @@ import 'dart:ui' show PointMode;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'scanner.dart';
 
@@ -26,6 +27,31 @@ class _CropScreenState extends State<CropScreen> {
 
   /// 손으로 잡을 수 있는 점: 모서리 4개 + 위·아래 가운데 2개 (나머지 점은 자동으로 따라온다)
   static const _visible = {0, kMid, kPts - 1, kPts, kPts + kMid, 2 * kPts - 1};
+
+  /// 모서리 손잡이 번호 → 모서리 번호 (좌상 0, 우상 1, 우하 2, 좌하 3)
+  static const _cornerOf = {0: 0, kPts - 1: 1, 2 * kPts - 1: 2, kPts: 3};
+
+  /// 막 붙은 모서리 (잠깐 빛나는 표시)
+  int? _snapped;
+  int _snapSeq = 0;
+
+  /// 놓은 모서리를 근처의 실제 종이 모서리에 붙인다. 선들은 함께 따라온다.
+  Future<void> _snap(int handle) async {
+    final corner = _cornerOf[handle];
+    if (corner == null) return;
+    final seq = ++_snapSeq;
+    final quad = [_shape.top.first, _shape.top.last, _shape.bottom.last, _shape.bottom.first];
+    final p = await compute(snapCorner, (_jpg, quad, corner));
+    // 그 사이 다른 점을 잡았으면 무시
+    if (!mounted || p == null || seq != _snapSeq || _dragging != null) return;
+    HapticFeedback.selectionClick();
+    setState(() {
+      _setPoint(handle, p);
+      _snapped = handle;
+    });
+    await Future.delayed(const Duration(milliseconds: 700));
+    if (mounted && seq == _snapSeq) setState(() => _snapped = null);
+  }
 
   /// 점 하나를 옮기면 그 변 전체를 자연스럽게 다시 그린다.
   /// - 모서리·제본선: 변의 굴곡 모양은 유지한 채 따라 움직임
@@ -84,7 +110,7 @@ class _CropScreenState extends State<CropScreen> {
         backgroundColor: Colors.black,
         title: const Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Text('윤곽 수정'),
-          Text('모서리 4개 · 가운데 점은 끌면 굴곡이 한 번에 휩니다',
+          Text('모서리는 놓으면 종이 끝에 자동으로 붙어요 · 가운데 점은 굴곡',
               style: TextStyle(fontSize: 12, color: Colors.white60)),
         ]),
       ),
@@ -108,6 +134,7 @@ class _CropScreenState extends State<CropScreen> {
 
                 return GestureDetector(
                   onPanStart: (e) {
+                    _snapSeq++;
                     // 손가락에서 가장 가까운 조절점을 잡는다
                     int? best;
                     for (final i in _visible) {
@@ -123,7 +150,11 @@ class _CropScreenState extends State<CropScreen> {
                     if (i == null) return;
                     setState(() => _setPoint(i, toImage(e.localPosition)));
                   },
-                  onPanEnd: (_) => setState(() => _dragging = null),
+                  onPanEnd: (_) {
+                    final i = _dragging;
+                    setState(() => _dragging = null);
+                    if (i != null) _snap(i);
+                  },
                   child: Stack(children: [
                     Positioned(
                       left: ox,
@@ -134,7 +165,7 @@ class _CropScreenState extends State<CropScreen> {
                     ),
                     Positioned.fill(
                       child: CustomPaint(
-                          painter: _ShapePainter(top, bottom, _shape.spread, _dragging)),
+                          painter: _ShapePainter(top, bottom, _shape.spread, _dragging, _snapped)),
                     ),
                     if (_dragging != null)
                       _Magnifier(
@@ -191,7 +222,10 @@ class _CropScreenState extends State<CropScreen> {
 }
 
 class _ShapePainter extends CustomPainter {
-  _ShapePainter(this.top, this.bottom, this.spread, this.active);
+  _ShapePainter(this.top, this.bottom, this.spread, this.active, this.snapped);
+
+  /// 방금 종이 모서리에 붙은 점 (빛나는 고리)
+  final int? snapped;
 
   final List<Offset> top, bottom;
   final bool spread;
@@ -229,6 +263,13 @@ class _ShapePainter extends CustomPainter {
       final corner = i == 0 || i == kPts - 1 || i == kPts || i == 2 * kPts - 1;
       final spine = spread && (i == kMid || i == kPts + kMid);
       final r = i == active ? 17.0 : (corner ? 13.0 : 11.0);
+      if (i == snapped) {
+        canvas.drawCircle(pts[i], r + 9,
+            Paint()
+              ..color = const Color(0xFF4FE3C1)
+              ..style = PaintingStyle.stroke
+              ..strokeWidth = 3);
+      }
       canvas.drawCircle(pts[i], r, Paint()..color = Colors.white);
       canvas.drawCircle(
           pts[i],
