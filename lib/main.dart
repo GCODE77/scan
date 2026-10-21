@@ -144,10 +144,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 onChanged: (v) => setState(() => _query = v),
               )
             : Row(children: [
-                ShaderMask(
-                  shaderCallback: AppColors.gradient.createShader,
-                  child: const Icon(Icons.auto_stories_rounded, color: Colors.white, size: 28),
-                ),
+                const AppLogo(size: 30),
                 const SizedBox(width: 10),
                 const Text('북스캔'),
               ]),
@@ -296,17 +293,13 @@ class _Empty extends StatelessWidget {
       child: Padding(
         padding: const EdgeInsets.fromLTRB(40, 0, 40, 120),
         child: Column(mainAxisSize: MainAxisSize.min, children: [
+          // 아이콘에 은은한 빛
           Container(
-            width: 120,
-            height: 120,
             decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              gradient: LinearGradient(colors: [
-                AppColors.accent.withValues(alpha: .25),
-                AppColors.accent2.withValues(alpha: .1),
-              ]),
+              borderRadius: BorderRadius.circular(32),
+              boxShadow: [BoxShadow(color: AppColors.accent.withValues(alpha: .35), blurRadius: 40)],
             ),
-            child: const Icon(Icons.menu_book_rounded, size: 56, color: AppColors.accent),
+            child: const AppLogo(size: 120),
           ),
           const SizedBox(height: 28),
           const Text('책을 스캐너처럼',

@@ -253,7 +253,12 @@ class _EditorScreenState extends State<EditorScreen> {
               children: [
                 for (final m in ScanMode.values)
                   GestureDetector(
-                    onTap: _busy ? null : () => _setFilter(m),
+                    onTap: _busy
+                        ? null
+                        : () {
+                            HapticFeedback.selectionClick();
+                            _setFilter(m);
+                          },
                     onLongPress: _busy ? null : () => _filterAllDialog(m),
                     child: Container(
                       width: 84,

@@ -117,3 +117,14 @@ class GradientButton extends StatelessWidget {
     );
   }
 }
+
+/// 앱 아이콘 (런처 아이콘과 같은 그림)
+class AppLogo extends StatelessWidget {
+  const AppLogo({super.key, this.size = 32});
+
+  final double size;
+
+  @override
+  Widget build(BuildContext context) =>
+      Image.asset('assets/icon/icon_full.png', width: size, height: size, filterQuality: FilterQuality.medium);
+}

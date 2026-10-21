@@ -155,10 +155,7 @@ class Updater {
     showDialog(
       context: context,
       builder: (d) => AlertDialog(
-        icon: ShaderMask(
-          shaderCallback: AppColors.gradient.createShader,
-          child: const Icon(Icons.auto_stories_rounded, color: Colors.white, size: 48),
-        ),
+        icon: const AppLogo(size: 64),
         title: const Text('북스캔'),
         content: Column(mainAxisSize: MainAxisSize.min, children: [
           Text('버전 v$current', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),

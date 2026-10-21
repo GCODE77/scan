@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 
 import 'ocr.dart';
@@ -26,6 +27,7 @@ class _CameraScreenState extends State<CameraScreen> {
   String? _error;
   FlashMode _flash = FlashMode.off;
   bool _flashEffect = false;
+  bool _pressed = false;
 
   /// 화면을 누른 곳 (초점 표시용, 0~1 비율)
   Offset? _focusAt;
@@ -67,6 +69,7 @@ class _CameraScreenState extends State<CameraScreen> {
   Future<void> _shoot() async {
     final c = _controller;
     if (c == null || c.value.isTakingPicture) return;
+    HapticFeedback.mediumImpact();
     final file = await c.takePicture();
     setState(() => _flashEffect = true);
     Future.delayed(const Duration(milliseconds: 120), () {
@@ -108,6 +111,7 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   Future<void> _finish() async {
+    HapticFeedback.lightImpact();
     if (_processing > 0) await _queue;
     if (mounted) Navigator.pop(context, _pages);
   }
@@ -241,15 +245,26 @@ class _CameraScreenState extends State<CameraScreen> {
                     ),
                   ),
                   const Spacer(),
+                  // 셔터: 누르는 동안 살짝 작아진다
                   GestureDetector(
+                    onTapDown: (_) => setState(() => _pressed = true),
+                    onTapUp: (_) => setState(() => _pressed = false),
+                    onTapCancel: () => setState(() => _pressed = false),
                     onTap: _shoot,
-                    child: Container(
-                      width: 76,
-                      height: 76,
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        border: Border.all(color: Colors.white, width: 5),
-                        color: Colors.white24,
+                    child: AnimatedScale(
+                      scale: _pressed ? 0.88 : 1,
+                      duration: const Duration(milliseconds: 90),
+                      child: Container(
+                        width: 78,
+                        height: 78,
+                        padding: const EdgeInsets.all(5),
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          border: Border.all(color: Colors.white, width: 4),
+                        ),
+                        child: const DecoratedBox(
+                          decoration: BoxDecoration(shape: BoxShape.circle, color: Colors.white),
+                        ),
                       ),
                     ),
                   ),
