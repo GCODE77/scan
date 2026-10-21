@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:ota_update/ota_update.dart';
 import 'package:package_info_plus/package_info_plus.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'theme.dart';
@@ -59,11 +60,29 @@ class Updater {
     return false;
   }
 
+  /// 업데이트를 시도한 버전 기록 (다시 켰을 때 설치됐는지 확인용)
+  static Future<File> _attemptFile() async =>
+      File('${(await getApplicationSupportDirectory()).path}/update_attempt.txt');
+
+  static Future<void> _markAttempt(String version) async => (await _attemptFile()).writeAsString(version);
+
   /// 새 버전이 있으면 알림 창. [manual]이면 최신일 때·실패할 때도 알려 준다.
   static Future<void> checkAndPrompt(BuildContext context, {bool manual = false}) async {
     final current = await currentVersion();
     final rel = await latest();
     if (!context.mounted) return;
+
+    // 지난번에 업데이트를 눌렀는데 아직 옛 버전이면: 앱 안 설치가 끝나지 않은 것 → 웹에서 받기를 먼저 권한다
+    final f = await _attemptFile();
+    final attempted = await f.exists() ? (await f.readAsString()).trim() : null;
+    if (attempted != null && !isNewer(attempted, current)) await f.delete(); // 설치 성공
+    final failedBefore = attempted != null && isNewer(attempted, current);
+    if (!context.mounted) return;
+    if (rel != null && failedBefore && isNewer(rel.version, current)) {
+      await _failedDialog(context, current, rel);
+      return;
+    }
+
     if (rel == null || !isNewer(rel.version, current)) {
       if (manual) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -92,11 +111,40 @@ class Updater {
       ),
     );
     if (ok == true && context.mounted) {
+      await _markAttempt(rel.version);
+      if (!context.mounted) return;
       showDialog(
         context: context,
         barrierDismissible: false,
         builder: (_) => _DownloadDialog(rel: rel),
       );
+    }
+  }
+
+  /// 지난 업데이트가 설치되지 않았을 때
+  static Future<void> _failedDialog(BuildContext context, String current, Release rel) async {
+    final choice = await showDialog<String>(
+      context: context,
+      builder: (d) => AlertDialog(
+        icon: const Icon(Icons.info_outline_rounded, color: Colors.orangeAccent, size: 36),
+        title: const Text('업데이트가 설치되지 않았어요'),
+        content: Text(
+          '지금 버전은 v$current 입니다. (새 버전 v${rel.version})\n\n'
+          '앱 안에서 설치가 끝나지 않았습니다. 아래 "웹에서 받아 설치"를 누르면 '
+          '브라우저에서 BookScan.apk를 받습니다. 받은 파일을 열어 설치해 주세요.',
+          style: const TextStyle(height: 1.5),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(d, 'later'), child: const Text('나중에')),
+          TextButton(onPressed: () => Navigator.pop(d, 'retry'), child: const Text('앱에서 다시')),
+          FilledButton(onPressed: () => Navigator.pop(d, 'web'), child: const Text('웹에서 받아 설치')),
+        ],
+      ),
+    );
+    if (choice == 'web') {
+      await launchUrl(Uri.parse(rel.apkUrl), mode: LaunchMode.externalApplication);
+    } else if (choice == 'retry' && context.mounted) {
+      showDialog(context: context, barrierDismissible: false, builder: (_) => _DownloadDialog(rel: rel));
     }
   }
 
@@ -167,7 +215,9 @@ class _DownloadDialogState extends State<_DownloadDialog> {
     });
     try {
       OtaUpdate()
-          .execute(widget.rel.apkUrl, destinationFilename: 'BookScan-${widget.rel.version}.apk')
+          // 안드로이드 공식 설치 방식: 설치 결과(성공/실패)를 받을 수 있다
+          .execute(widget.rel.apkUrl,
+              destinationFilename: 'BookScan-${widget.rel.version}.apk', usePackageInstaller: true)
           .listen(
         (e) {
           if (!mounted) return;
@@ -175,7 +225,9 @@ class _DownloadDialogState extends State<_DownloadDialog> {
             case OtaStatus.DOWNLOADING:
               setState(() => _progress = (double.tryParse(e.value ?? '') ?? 0) / 100);
             case OtaStatus.INSTALLING:
+              setState(() => _installing = true);
             case OtaStatus.INSTALLATION_DONE:
+              // 설치가 끝나면 시스템이 앱을 다시 시작한다
               setState(() => _installing = true);
             case OtaStatus.PERMISSION_NOT_GRANTED_ERROR:
               setState(() {
@@ -198,7 +250,9 @@ class _DownloadDialogState extends State<_DownloadDialog> {
   }
 
   Future<void> _openWeb() async {
-    await launchUrl(Uri.parse(_releasesPage), mode: LaunchMode.externalApplication);
+    // APK를 바로 내려받는 주소 (안 되면 릴리스 페이지)
+    final ok = await launchUrl(Uri.parse(widget.rel.apkUrl), mode: LaunchMode.externalApplication);
+    if (!ok) await launchUrl(Uri.parse(_releasesPage), mode: LaunchMode.externalApplication);
   }
 
   @override
