@@ -73,35 +73,42 @@ const scanModeLabels = {
 /// isolate에서 실행된다: 사진 경로 → 페이지 윤곽(모서리 + 굴곡) 검출.
 Future<Detection> detectPage(String path) async {
   final img = cv.imread(path, flags: cv.IMREAD_COLOR);
+  if (img.isEmpty) throw Exception('읽을 수 없는 사진 형식입니다');
   final w = img.cols, h = img.rows;
   final (_, jpg) = cv.imencode('.jpg', img, params: cv.VecI32.fromList([cv.IMWRITE_JPEG_QUALITY, 95]));
 
   // 작게 줄여서 분석 (속도와 잡음 감소)
   final scale = 800 / math.max(w, h);
   final small = cv.resize(img, ((w * scale).round(), (h * scale).round()), interpolation: cv.INTER_AREA);
-  final blur = cv.gaussianBlur(cv.cvtColor(small, cv.COLOR_BGR2GRAY), (7, 7), 0);
+  final gray = cv.cvtColor(small, cv.COLOR_BGR2GRAY);
+  final blur = cv.gaussianBlur(gray, (7, 7), 0);
   final paper = _paperMask(blur);
 
-  Detection fallback() {
+  if (paper == null) {
     // 못 찾으면 사진 전체를 페이지로 (사용자가 원하면 나중에 자르기로 조정)
     final c = [Offset.zero, Offset(w - 1.0, 0), Offset(w - 1.0, h - 1.0), Offset(0, h - 1.0)];
     return Detection(jpg, w, h, PageShape.quad(c, false), false);
   }
-
-  if (paper == null) return fallback();
   final (blob, quad0) = paper;
-  final g = _Gray(blur), m = _Gray(blob);
+
+  // 잉크 (글자·음표·선): 주변보다 어두운 점
+  var inkM = cv.adaptiveThreshold(gray, 255, cv.ADAPTIVE_THRESH_MEAN_C, cv.THRESH_BINARY_INV, 25, 15);
+  inkM = cv.bitwiseAND(inkM, blob);
+  inkM = cv.morphologyEx(inkM, cv.MORPH_OPEN, cv.getStructuringElement(cv.MORPH_RECT, (2, 2)));
+
+  final g = _Gray(blur), ink = _Gray(inkM), m = _Gray(blob);
   var [tl, tr, br, bl] = quad0;
 
-  // 제본선 (펼친 책의 가운데 골짜기)
-  final spine = _findSpine(g, tl, tr, br, bl);
+  // 1) 제본선: 어두운 골짜기 → 없으면 글자 덩어리 사이 여백
+  final spine = _findSpine(g, ink, tl, tr, br, bl) ?? _inkGapSpine(ink, tl, tr, br, bl);
+
+  // 2) 사진 밖으로 잘린 옆 페이지는 버린다. 양쪽이 비슷하면 양면.
   var spread = false;
   if (spine != null) {
     final (st, sb) = spine;
     final wl = ((st - tl).distance + (sb - bl).distance) / 2;
     final wr = ((tr - st).distance + (br - sb).distance) / 2;
     if (wl < wr * 0.6) {
-      // 왼쪽은 사진 밖으로 잘린 조각 → 오른쪽 페이지만
       tl = st;
       bl = sb;
     } else if (wr < wl * 0.6) {
@@ -112,19 +119,33 @@ Future<Detection> detectPage(String path) async {
     }
   }
 
-  // 위·아래 가장자리를 따라갈 기준점 (양면이면 가운데 점이 제본선 위에 오도록)
-  List<Offset> bases(Offset a, Offset mid, Offset b) => spread
-      ? [
-          for (var i = 0; i <= kMid; i++) Offset.lerp(a, mid, i / kMid)!,
-          for (var i = 1; i <= kMid; i++) Offset.lerp(mid, b, i / kMid)!,
-        ]
-      : [for (var i = 0; i < kPts; i++) Offset.lerp(a, b, i / (kPts - 1))!];
+  // 3) 굴곡: 페이지 안 글자 줄의 휜 모양 (없으면 종이 가장자리를 따라감)
+  final lines = _TextLines(inkM);
+  (List<Offset>, List<Offset>) curves(Offset tl, Offset tr, Offset br, Offset bl, int n) {
+    final byText = lines.edges(tl, tr, br, bl, n);
+    if (byText != null) return byText;
+    final center = (tl + tr + br + bl) / 4;
+    final pageH = ((bl - tl).distance + (br - tr).distance) / 2;
+    return (
+      _traceEdge(m, [for (var i = 0; i < n; i++) Offset.lerp(tl, tr, i / (n - 1))!], center, pageH),
+      _traceEdge(m, [for (var i = 0; i < n; i++) Offset.lerp(bl, br, i / (n - 1))!], center, pageH),
+    );
+  }
 
-  final center = (tl + tr + br + bl) / 4;
-  final pageH = ((bl - tl).distance + (br - tr).distance) / 2;
-  final top = _traceEdge(m, bases(tl, spine?.$1 ?? tl, tr), center, pageH);
-  final bottom = _traceEdge(m, bases(bl, spine?.$2 ?? bl, br), center, pageH);
-  Offset up(Offset p) => Offset((p.dx / scale).clamp(0, w - 1.0), (p.dy / scale).clamp(0, h - 1.0));
+  List<Offset> top, bottom;
+  if (spread) {
+    final (st, sb) = spine!;
+    final (lt, lb) = curves(tl, st, sb, bl, kMid + 1);
+    final (rt, rb) = curves(st, tr, br, sb, kMid + 1);
+    // 두 페이지가 만나는 제본선 점은 평균
+    top = [...lt.sublist(0, kMid), (lt.last + rt.first) / 2, ...rt.sublist(1)];
+    bottom = [...lb.sublist(0, kMid), (lb.last + rb.first) / 2, ...rb.sublist(1)];
+  } else {
+    (top, bottom) = curves(tl, tr, br, bl, kPts);
+  }
+
+  // 원본 크기로 (곡선이 사진 밖으로 조금 나가는 것은 허용)
+  Offset up(Offset p) => Offset((p.dx / scale).clamp(-w * .1, w * 1.1), (p.dy / scale).clamp(-h * .1, h * 1.1));
   return Detection(jpg, w, h, PageShape(top.map(up).toList(), bottom.map(up).toList(), spread), true);
 }
 
@@ -247,9 +268,9 @@ List<Offset> _traceEdge(_Gray mask, List<Offset> bases, Offset center, double pa
 }
 
 /// 제본선(펼친 책 가운데 골짜기)을 찾는다. 기울어진 직선(위 점, 아래 점)으로.
-/// 선 위 점이 양옆보다 어두운 정도의 '중앙값'을 본다 → 끊김 없이 이어진 골짜기만 높게 나오고
-/// 띄엄띄엄 있는 글자·음표는 걸러진다. 없으면 null.
-(Offset, Offset)? _findSpine(_Gray g, Offset tl, Offset tr, Offset br, Offset bl) {
+/// 선 위 점이 양옆보다 어두운 정도의 '중앙값' → 끊김 없이 이어진 깊은 골짜기만 높게 나온다.
+/// 글자가 가로지르는 선(양옆에 동시에 잉크)은 제본선이 아니다. 없으면 null.
+(Offset, Offset)? _findSpine(_Gray g, _Gray ink, Offset tl, Offset tr, Offset br, Offset bl) {
   double valley(Offset a, Offset b) {
     var best = 0.0;
     for (final d in const [5, 12]) {
@@ -264,11 +285,24 @@ List<Offset> _traceEdge(_Gray mask, List<Offset> bases, Offset center, double pa
         best = math.max(best, v[v.length ~/ 2]);
       }
     }
-    return best;
+    if (best <= 0) return 0;
+    var hits = 0;
+    for (var k = 0; k < 40; k++) {
+      final p = Offset.lerp(a, b, 0.1 + 0.8 * k / 39)!;
+      bool any(int from, int to) {
+        for (var x = from; x <= to; x++) {
+          if (ink.on(Offset(p.dx + x, p.dy))) return true;
+        }
+        return false;
+      }
+
+      if (any(-11, -5) && any(5, 11)) hits++;
+    }
+    return hits / 40 < 0.2 ? best : 0;
   }
 
   (Offset, Offset)? best;
-  var bestScore = 6.0; // 이보다 약하면 제본선 없음 (한 쪽 페이지)
+  var bestScore = 12.0; // 이보다 얕으면 제본선 그림자가 아니다
   for (var i = 0; i <= 120; i++) {
     final s = 0.08 + 0.84 * i / 120;
     final a = Offset.lerp(tl, tr, s)!;
@@ -283,6 +317,238 @@ List<Offset> _traceEdge(_Gray mask, List<Offset> bases, Offset center, double pa
     }
   }
   return best;
+}
+
+/// 골짜기가 안 보일 때: 글자 덩어리(세로로 본 잉크 분포) 사이의 빈 여백을 제본선으로.
+(Offset, Offset)? _inkGapSpine(_Gray ink, Offset tl, Offset tr, Offset br, Offset bl) {
+  final w = ink.w, h = ink.h;
+  final y0 = (h * .1).round(), y1 = (h * .9).round();
+  final col = List<double>.filled(w, 0);
+  for (var x = 0; x < w; x++) {
+    var c = 0;
+    for (var y = y0; y < y1; y++) {
+      if (ink.data[y * w + x] > 0) c++;
+    }
+    col[x] = c / (y1 - y0);
+  }
+  // 이동 평균으로 부드럽게
+  final k = math.max(3, w ~/ 50);
+  final sm = List<double>.filled(w, 0);
+  for (var x = 0; x < w; x++) {
+    var s = 0.0, n = 0;
+    for (var j = x - k ~/ 2; j <= x + k ~/ 2; j++) {
+      if (j >= 0 && j < w) {
+        s += col[j];
+        n++;
+      }
+    }
+    sm[x] = s / n;
+  }
+
+  // 잉크가 있는 구간들 (좁은 틈은 이어 붙임)
+  final runs = <List<int>>[];
+  int? start;
+  for (var x = 0; x <= w; x++) {
+    final on = x < w && sm[x] > 0.02;
+    if (on && start == null) start = x;
+    if (!on && start != null) {
+      if (runs.isNotEmpty && start - runs.last[1] < w * 0.035) {
+        runs.last[1] = x;
+      } else {
+        runs.add([start, x]);
+      }
+      start = null;
+    }
+  }
+  runs.removeWhere((r) => r[1] - r[0] <= w * 0.03);
+  if (runs.length < 2) return null;
+
+  final main = runs.reduce((a, b) => (a[1] - a[0]) >= (b[1] - b[0]) ? a : b);
+  final i = runs.indexOf(main);
+  final nb = [for (final j in [i - 1, i + 1]) if (j >= 0 && j < runs.length) runs[j]]
+      .reduce((a, b) => (a[1] - a[0]) >= (b[1] - b[0]) ? a : b);
+  final gx = nb[1] <= main[0] ? (nb[1] + main[0]) / 2 : (main[1] + nb[0]) / 2;
+
+  Offset atX(Offset a, Offset b, double x) {
+    final t = b.dx == a.dx ? 0.0 : ((x - a.dx) / (b.dx - a.dx)).clamp(0.0, 1.0);
+    return Offset.lerp(a, b, t)!;
+  }
+
+  return (atX(tl, tr, gx), atX(bl, br, gx));
+}
+
+/// 글자 줄(오선·가사·문장)을 찾아 휜 모양을 재고, 페이지 위·아래 곡선을 만든다.
+class _TextLines {
+  _TextLines(cv.Mat ink) {
+    w = ink.cols;
+    h = ink.rows;
+    // 가로로 길게 이어 붙여 줄 덩어리로
+    final kx = math.max(15, w ~/ 18);
+    final k = cv.getStructuringElement(cv.MORPH_RECT, (kx, 1));
+    var lm = cv.morphologyEx(ink, cv.MORPH_CLOSE, k);
+    lm = cv.morphologyEx(lm, cv.MORPH_OPEN, k);
+    final labels = cv.Mat.empty(), stats = cv.Mat.empty(), cents = cv.Mat.empty();
+    final n = cv.connectedComponentsWithStats(lm, labels, stats, cents, 8, cv.MatType.CV_32S, -1);
+    final lab = Uint8List.fromList(labels.data).buffer.asInt32List();
+
+    for (var i = 1; i < n; i++) {
+      final x = stats.at<int>(i, 0), y = stats.at<int>(i, 1);
+      final bw = stats.at<int>(i, 2), bh = stats.at<int>(i, 3);
+      if (!(bw > w * .12 && bh < h * .05 && bw / math.max(bh, 1) > 8)) continue;
+      final pts = <Offset>[];
+      for (var cx = x; cx < x + bw; cx += 3) {
+        var sum = 0, cnt = 0;
+        for (var cy = y; cy < y + bh; cy++) {
+          if (lab[cy * w + cx] == i) {
+            sum += cy;
+            cnt++;
+          }
+        }
+        if (cnt > 0) pts.add(Offset(cx.toDouble(), sum / cnt));
+      }
+      if (pts.length >= 10) _lines.add(pts);
+    }
+  }
+
+  late final int w, h;
+  final _lines = <List<Offset>>[];
+
+  /// 페이지 사각형 안 줄들로 위·아래 곡선 (각 n점). 쓸 만한 줄이 2개 미만이면 null.
+  (List<Offset>, List<Offset>)? edges(Offset tl, Offset tr, Offset br, Offset bl, int n) {
+    final topY = (tl.dy + tr.dy) / 2, botY = (bl.dy + br.dy) / 2;
+    double rowR(double y) => ((y - topY) / math.max(1, botY - topY)).clamp(0.0, 1.0);
+    double pageU(Offset p) {
+      final r = rowR(p.dy);
+      final lx = Offset.lerp(tl, bl, r)!.dx, rx = Offset.lerp(tr, br, r)!.dx;
+      return (p.dx - lx) / math.max(1, rx - lx);
+    }
+
+    // 줄마다 y = a·u² + b·u + c 로 맞춤 (u = 페이지 안 가로 위치 0~1)
+    final cs = <double>[];
+    final ps = <List<double>>[];
+    for (final line in _lines) {
+      final us = <double>[], ys = <double>[];
+      var inside = 0;
+      for (final p in line) {
+        final u = pageU(p);
+        if (u > -0.02 && u < 1.02) {
+          inside++;
+          us.add(u);
+          ys.add(p.dy);
+        }
+      }
+      if (inside < line.length * 0.9) continue; // 제본선을 넘어 옆 페이지와 섞인 줄
+      if (us.isEmpty || us.reduce(math.max) - us.reduce(math.min) < 0.5) continue; // 짧은 조각
+      final p = _polyfit2(us, ys);
+      if (p == null) continue;
+      var err = 0.0;
+      for (var j = 0; j < us.length; j++) {
+        err += (_poly(p, us[j]) - ys[j]).abs();
+      }
+      if (err / us.length > 3) continue;
+      final c = _poly(p, 0.5);
+      cs.add(c);
+      ps.add([p[0], p[1], p[2] - c]); // 가운데에서 0이 되는 '모양'
+    }
+    if (cs.length < 2) return null;
+
+    // 모양이 높이(c)에 따라 선형으로 변한다고 보고 맞춘다 (튀는 줄은 빼고 다시)
+    var keep = List.filled(cs.length, true);
+    late List<List<double>> coef; // [계수][0=절편,1=기울기]
+    for (var it = 0; it < 3; it++) {
+      coef = [for (var j = 0; j < 3; j++) _linreg(cs, [for (final p in ps) p[j]], keep)];
+      final errs = <double>[];
+      for (var i = 0; i < cs.length; i++) {
+        final pred = [for (var j = 0; j < 3; j++) coef[j][0] + coef[j][1] * cs[i]];
+        var e = 0.0;
+        for (var t = 0; t <= 8; t++) {
+          final u = t / 8;
+          e = math.max(e, (_poly(ps[i], u) - _poly(pred, u)).abs());
+        }
+        errs.add(e);
+      }
+      final sorted = [...errs]..sort();
+      final lim = math.max(2.0, sorted[sorted.length ~/ 2] * 2.5);
+      keep = [for (final e in errs) e < lim];
+      if (keep.where((k) => k).length < 2) return null;
+    }
+    final kept = [for (var i = 0; i < cs.length; i++) if (keep[i]) cs[i]];
+    final lo = kept.reduce(math.min), hi = kept.reduce(math.max);
+
+    // 높이 Y의 줄 모양으로 한 줄(n점) 만들기. 글자 영역 밖은 가장 바깥 줄 모양 유지.
+    List<Offset> row(double y) {
+      final yc = y.clamp(lo, hi);
+      final s = [for (var j = 0; j < 3; j++) coef[j][0] + coef[j][1] * yc];
+      final r = rowR(y);
+      final lx = Offset.lerp(tl, bl, r)!.dx, rx = Offset.lerp(tr, br, r)!.dx;
+      return [
+        for (var i = 0; i < n; i++)
+          Offset(lx + (rx - lx) * i / (n - 1), y + _poly(s, i / (n - 1))),
+      ];
+    }
+
+    return (row(topY), row(botY));
+  }
+}
+
+double _poly(List<double> p, double u) => (p[0] * u + p[1]) * u + p[2];
+
+/// 2차 최소제곱 맞춤 → [a, b, c] (y = a·u² + b·u + c)
+List<double>? _polyfit2(List<double> u, List<double> y) {
+  // 정규방정식 (3x3)
+  final s = List<double>.filled(5, 0), t = List<double>.filled(3, 0);
+  for (var i = 0; i < u.length; i++) {
+    var p = 1.0;
+    for (var k = 0; k < 5; k++) {
+      s[k] += p;
+      if (k < 3) t[k] += p * y[i];
+      p *= u[i];
+    }
+  }
+  // [s4 s3 s2][a]   [t2]
+  // [s3 s2 s1][b] = [t1]
+  // [s2 s1 s0][c]   [t0]
+  final m = [
+    [s[4], s[3], s[2], t[2]],
+    [s[3], s[2], s[1], t[1]],
+    [s[2], s[1], s[0], t[0]],
+  ];
+  for (var c = 0; c < 3; c++) {
+    var piv = c;
+    for (var r = c + 1; r < 3; r++) {
+      if (m[r][c].abs() > m[piv][c].abs()) piv = r;
+    }
+    if (m[piv][c].abs() < 1e-9) return null;
+    final tmp = m[c];
+    m[c] = m[piv];
+    m[piv] = tmp;
+    for (var r = 0; r < 3; r++) {
+      if (r == c) continue;
+      final f = m[r][c] / m[c][c];
+      for (var k = c; k < 4; k++) {
+        m[r][k] -= f * m[c][k];
+      }
+    }
+  }
+  return [m[0][3] / m[0][0], m[1][3] / m[1][1], m[2][3] / m[2][2]];
+}
+
+/// 단순 선형 회귀 y = a + b·x (keep인 점만) → [a, b]
+List<double> _linreg(List<double> x, List<double> y, List<bool> keep) {
+  var n = 0, sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0;
+  for (var i = 0; i < x.length; i++) {
+    if (!keep[i]) continue;
+    n++;
+    sx += x[i];
+    sy += y[i];
+    sxx += x[i] * x[i];
+    sxy += x[i] * y[i];
+  }
+  final d = n * sxx - sx * sx;
+  if (n == 0) return [0, 0];
+  if (d.abs() < 1e-9) return [sy / n, 0];
+  final b = (n * sxy - sx * sy) / d;
+  return [(sy - b * sx) / n, b];
 }
 
 // ───────────────────────── 펴기 ─────────────────────────

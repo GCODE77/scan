@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 
 import 'ocr.dart';
 import 'scanner.dart';
@@ -63,22 +64,38 @@ class _CameraScreenState extends State<CameraScreen> {
     final c = _controller;
     if (c == null || c.value.isTakingPicture) return;
     final file = await c.takePicture();
-    setState(() {
-      _processing++;
-      _flashEffect = true;
-    });
+    setState(() => _flashEffect = true);
     Future.delayed(const Duration(milliseconds: 120), () {
       if (mounted) setState(() => _flashEffect = false);
     });
+    _process(file.path, deleteAfter: true);
+  }
+
+  /// 갤러리에서 사진 여러 장 불러오기 → 찍은 사진과 똑같이 자동 인식·펴기
+  Future<void> _pickFromGallery() async {
+    final picked = await ImagePicker().pickMultiImage(requestFullMetadata: false);
+    for (final f in picked) {
+      _process(f.path, deleteAfter: false);
+    }
+  }
+
+  void _process(String path, {required bool deleteAfter}) {
+    setState(() => _processing++);
     // 촬영은 바로 다음 장으로, 인식·펴기는 순서대로 뒤에서
     _queue = _queue.then((_) async {
       try {
-        final (det, flats) = await compute(autoScan, file.path);
+        final (det, flats) = await compute(autoScan, path);
         for (var i = 0; i < flats.length; i++) {
           _pages.add(ScanPage(det: det, shape: det.shape, part: i, flat: flats[i]));
         }
+      } catch (e) {
+        // 한 장이 실패해도 다음 장은 계속 (예: 읽을 수 없는 형식)
+        if (mounted) {
+          ScaffoldMessenger.of(context)
+              .showSnackBar(SnackBar(content: Text('사진 한 장을 처리하지 못했습니다: $e')));
+        }
       } finally {
-        File(file.path).delete().ignore();
+        if (deleteAfter) File(path).delete().ignore();
         if (mounted) setState(() => _processing--);
       }
     });
@@ -143,6 +160,11 @@ class _CameraScreenState extends State<CameraScreen> {
                 onPressed: () => Navigator.pop(context),
               ),
               const Spacer(),
+              TextButton.icon(
+                onPressed: _pickFromGallery,
+                icon: const Icon(Icons.photo_library_outlined, color: Colors.white),
+                label: const Text('사진 불러오기', style: TextStyle(color: Colors.white)),
+              ),
               IconButton(
                 icon: Icon(_flashInfo[_flash]!.$1,
                     color: _flash == FlashMode.off ? Colors.white : AppColors.accent),
