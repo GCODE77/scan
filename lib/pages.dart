@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import 'ocr.dart';
+import 'theme.dart';
 
 /// 페이지 썸네일 목록.
 /// 누르면 편집, 길게 누르면 선택 모드 (선택한 페이지만 저장·삭제).
@@ -21,9 +22,9 @@ class PageGrid extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return GridView.builder(
-      padding: const EdgeInsets.fromLTRB(12, 12, 12, 100),
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 120),
       gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: 3, childAspectRatio: 0.7, mainAxisSpacing: 10, crossAxisSpacing: 10),
+          crossAxisCount: 3, childAspectRatio: 0.72, mainAxisSpacing: 14, crossAxisSpacing: 14),
       itemCount: pages.length,
       itemBuilder: (context, i) {
         final p = pages[i];
@@ -31,37 +32,58 @@ class PageGrid extends StatelessWidget {
         return GestureDetector(
           onTap: () => onTap(i),
           onLongPress: () => onLongPress(i),
-          child: Column(children: [
-            Expanded(
+          child: AnimatedScale(
+            scale: sel ? .94 : 1,
+            duration: const Duration(milliseconds: 150),
+            child: Container(
+              decoration: BoxDecoration(
+                color: AppColors.card,
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: sel ? AppColors.accent : Colors.white10, width: sel ? 2.5 : 1),
+                boxShadow: const [BoxShadow(color: Colors.black45, blurRadius: 10, offset: Offset(0, 4))],
+              ),
+              clipBehavior: Clip.antiAlias,
               child: Stack(fit: StackFit.expand, children: [
-                Container(
-                  decoration: BoxDecoration(
-                      border: Border.all(
-                          color: sel ? Colors.teal : Colors.black12, width: sel ? 3 : 1),
-                      boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 4)]),
-                  child: Image.memory(p.jpg, fit: BoxFit.cover, cacheWidth: 300, gaplessPlayback: true),
+                Image.memory(p.jpg, fit: BoxFit.cover, cacheWidth: 300, gaplessPlayback: true),
+                // 아래쪽 페이지 번호 + 글자 인식 상태
+                Positioned(
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
+                  child: Container(
+                    padding: const EdgeInsets.fromLTRB(10, 14, 10, 6),
+                    decoration: const BoxDecoration(
+                      gradient: LinearGradient(
+                          begin: Alignment.topCenter,
+                          end: Alignment.bottomCenter,
+                          colors: [Colors.transparent, Colors.black87]),
+                    ),
+                    child: Row(children: [
+                      Text('${i + 1}',
+                          style: const TextStyle(fontWeight: FontWeight.w700, color: Colors.white)),
+                      const Spacer(),
+                      p.ocr == null
+                          ? const SizedBox(
+                              width: 10,
+                              height: 10,
+                              child: CircularProgressIndicator(strokeWidth: 1.5, color: Colors.white70))
+                          : Icon(Icons.text_fields_rounded,
+                              size: 14,
+                              color: p.ocr!.lines.isEmpty ? Colors.white38 : AppColors.accent),
+                    ]),
+                  ),
                 ),
                 if (selected.isNotEmpty)
                   Positioned(
                     right: 6,
                     top: 6,
-                    child: Icon(sel ? Icons.check_circle : Icons.radio_button_unchecked,
-                        color: sel ? Colors.teal : Colors.white,
-                        shadows: const [Shadow(blurRadius: 4)]),
+                    child: Icon(sel ? Icons.check_circle_rounded : Icons.radio_button_unchecked,
+                        color: sel ? AppColors.accent : Colors.white,
+                        shadows: const [Shadow(blurRadius: 6)]),
                   ),
               ]),
             ),
-            const SizedBox(height: 4),
-            Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-              Text('${i + 1}'),
-              const SizedBox(width: 4),
-              p.ocr == null
-                  ? const SizedBox(
-                      width: 10, height: 10, child: CircularProgressIndicator(strokeWidth: 1.5))
-                  : Icon(Icons.text_fields,
-                      size: 14, color: p.ocr!.lines.isEmpty ? Colors.grey : Colors.indigo),
-            ]),
-          ]),
+          ),
         );
       },
     );

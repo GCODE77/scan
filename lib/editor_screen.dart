@@ -6,6 +6,7 @@ import 'camera_screen.dart';
 import 'crop_screen.dart';
 import 'ocr.dart';
 import 'scanner.dart';
+import 'theme.dart';
 
 /// 촬영 후 편집 화면: 필터 고르기, 회전, 자르기, 다시 찍기, 텍스트 추출.
 /// [pages] 목록을 직접 고친다.
@@ -156,7 +157,7 @@ class _EditorScreenState extends State<EditorScreen> {
   @override
   Widget build(BuildContext context) {
     if (_pages.isEmpty) return const SizedBox();
-    const bg = Color(0xFF1E1F22);
+    const bg = AppColors.bg;
     return Scaffold(
       backgroundColor: bg,
       appBar: AppBar(
@@ -253,7 +254,7 @@ class _EditorScreenState extends State<EditorScreen> {
                       margin: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
                       decoration: BoxDecoration(
                         border: Border.all(
-                            color: _page.mode == m ? Colors.tealAccent : Colors.transparent,
+                            color: _page.mode == m ? AppColors.accent : Colors.transparent,
                             width: 2.5),
                         borderRadius: BorderRadius.circular(6),
                       ),
@@ -268,7 +269,7 @@ class _EditorScreenState extends State<EditorScreen> {
                             alignment: Alignment.bottomCenter,
                             child: Container(
                               width: double.infinity,
-                              color: _page.mode == m ? Colors.teal : Colors.black54,
+                              color: _page.mode == m ? AppColors.accent.withValues(alpha: .85) : Colors.black54,
                               padding: const EdgeInsets.symmetric(vertical: 3),
                               child: Text(scanModeLabels[m]!,
                                   textAlign: TextAlign.center,
@@ -296,7 +297,7 @@ class _EditorScreenState extends State<EditorScreen> {
               const SizedBox(width: 4),
               FilledButton(
                 style: FilledButton.styleFrom(
-                    backgroundColor: Colors.teal,
+                    backgroundColor: AppColors.accent,
                     minimumSize: const Size(64, 48),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
                 onPressed: _busy ? null : () => Navigator.pop(context),

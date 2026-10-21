@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 
 import 'ocr.dart';
 import 'scanner.dart';
+import 'theme.dart';
 
 /// 연속 촬영 화면. 셔터를 누를 때마다 뒤에서 페이지를 자동 인식·펴기 한다.
 /// '완료'를 누르면 만들어진 페이지 목록을 돌려준다.
@@ -166,9 +167,9 @@ class _CameraScreenState extends State<CameraScreen> {
                                 top: -8,
                                 child: CircleAvatar(
                                     radius: 12,
-                                    backgroundColor: Colors.teal,
+                                    backgroundColor: AppColors.accent,
                                     child: Text('$count',
-                                        style: const TextStyle(fontSize: 12, color: Colors.white))),
+                                        style: const TextStyle(fontSize: 12, color: Color(0xFF00281F), fontWeight: FontWeight.w700))),
                               ),
                           ]),
                   ),
@@ -192,7 +193,7 @@ class _CameraScreenState extends State<CameraScreen> {
                         ? null
                         : FilledButton(
                             style: FilledButton.styleFrom(
-                                backgroundColor: Colors.teal, padding: EdgeInsets.zero),
+                                backgroundColor: AppColors.accent, padding: EdgeInsets.zero, minimumSize: const Size(64, 48)),
                             onPressed: _finish,
                             child: const Icon(Icons.check),
                           ),

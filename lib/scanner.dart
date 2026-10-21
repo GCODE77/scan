@@ -5,7 +5,11 @@ import 'dart:ui' show Offset;
 import 'package:opencv_dart/opencv_dart.dart' as cv;
 
 /// 페이지 윤곽. 위·아래 가장자리를 각각 조절점 5개(왼쪽 끝 → 오른쪽 끝)로 표현한다.
-/// 양면(spread) 모드에서는 가운데 점(인덱스 2)이 책 가운데 접히는 선(제본선)이다.
+/// 양면(spread) 모드에서는 가운데 점(인덱스 [kMid])이 책 가운데 접히는 선(제본선)이다.
+/// 가장자리 하나의 조절점 수 (양 끝 모서리 포함)
+const kPts = 7;
+const kMid = kPts ~/ 2;
+
 class PageShape {
   PageShape(this.top, this.bottom, this.spread);
 
@@ -17,8 +21,8 @@ class PageShape {
 
   /// 네 모서리만으로 만든 곧은 사각형
   factory PageShape.quad(List<Offset> c, bool spread) => PageShape(
-        [for (var i = 0; i <= 4; i++) Offset.lerp(c[0], c[1], i / 4)!],
-        [for (var i = 0; i <= 4; i++) Offset.lerp(c[3], c[2], i / 4)!],
+        [for (var i = 0; i < kPts; i++) Offset.lerp(c[0], c[1], i / (kPts - 1))!],
+        [for (var i = 0; i < kPts; i++) Offset.lerp(c[3], c[2], i / (kPts - 1))!],
         spread,
       );
 }
@@ -77,10 +81,16 @@ Future<Detection> detectPage(String path) async {
   var spineS = 0.5;
   if (spread) spineS = _findSpine(img2, quad);
 
-  final ss = spread ? [0.0, spineS / 2, spineS, (1 + spineS) / 2, 1.0] : [0.0, .25, .5, .75, 1.0];
+  // 가장자리를 따라갈 지점들 (양면이면 가운데 점이 제본선에 오도록)
+  final ss = spread
+      ? [
+          for (var i = 0; i <= kMid; i++) spineS * i / kMid,
+          for (var i = 1; i <= kMid; i++) spineS + (1 - spineS) * i / kMid,
+        ]
+      : [for (var i = 0; i < kPts; i++) i / (kPts - 1)];
   final center = quad.reduce((a, b) => a + b) / 4;
-  final top = [for (final s in ss) _snapEdge(img2, quad[0], quad[1], s, center, heightPx)];
-  final bottom = [for (final s in ss) _snapEdge(img2, quad[3], quad[2], s, center, heightPx)];
+  final top = _traceEdge(img2, quad[0], quad[1], ss, center, heightPx);
+  final bottom = _traceEdge(img2, quad[3], quad[2], ss, center, heightPx);
   Offset up(Offset p) => p / scale;
   return Detection(jpg, w, h, PageShape(top.map(up).toList(), bottom.map(up).toList(), spread), true);
 }
@@ -143,15 +153,25 @@ class _Gray {
   }
 }
 
-/// 직선 a→b 위 s 지점에서, 수직 방향으로 실제 종이 가장자리(어두움→밝음 경계)를 찾는다.
-/// 책 가장자리의 휘어짐은 이렇게 여러 지점을 끌어당겨 따라간다.
-Offset _snapEdge(_Gray g, Offset a, Offset b, double s, Offset center, double pageH) {
-  final base = Offset.lerp(a, b, s)!;
-  if (s == 0 || s == 1) return base; // 모서리는 사각형 검출 결과를 그대로 쓴다
+/// 직선 a→b를 따라 여러 지점에서 실제 종이 가장자리(어두움→밝음 경계)를 찾아 곡선을 만든다.
+/// 이웃과 동떨어진 값(그림자·글자에 잘못 걸린 경우)은 이웃 평균으로 바로잡는다.
+List<Offset> _traceEdge(_Gray g, Offset a, Offset b, List<double> ss, Offset center, double pageH) {
   final d = b - a;
   var n = Offset(-d.dy, d.dx) / d.distance;
-  if ((center - base).dx * n.dx + (center - base).dy * n.dy < 0) n = -n; // 페이지 안쪽 방향
+  final mid = Offset.lerp(a, b, 0.5)!;
+  if ((center - mid).dx * n.dx + (center - mid).dy * n.dy < 0) n = -n; // 페이지 안쪽 방향
 
+  final off = [for (final s in ss) (s == 0 || s == 1) ? 0.0 : _snapOffset(g, a, b, s, n, pageH)];
+  final limit = pageH * 0.03;
+  for (var i = 1; i < off.length - 1; i++) {
+    final expect = (off[i - 1] + off[i + 1]) / 2;
+    if ((off[i] - expect).abs() > limit) off[i] = expect;
+  }
+  return [for (var i = 0; i < ss.length; i++) Offset.lerp(a, b, ss[i])! + n * off[i]];
+}
+
+/// s 지점에서 수직 방향으로 가장자리까지의 거리 (주변 5곳의 중앙값).
+double _snapOffset(_Gray g, Offset a, Offset b, double s, Offset n, double pageH) {
   final band = pageH * 0.12;
   final offsets = <double>[];
   for (var j = -2; j <= 2; j++) {
@@ -167,7 +187,7 @@ Offset _snapEdge(_Gray g, Offset a, Offset b, double s, Offset center, double pa
     offsets.add(bestT);
   }
   offsets.sort();
-  return base + n * offsets[2]; // 중앙값
+  return offsets[2];
 }
 
 /// 양면 사진에서 제본선(가운데 그림자)의 위치를 0~1 비율로 찾는다.
@@ -289,8 +309,8 @@ Future<List<Uint8List>> warpFlat((Uint8List, PageShape) args) async {
 
   final parts = shape.spread
       ? [
-          (top.sublist(0, 2 * _segSamples + 1), bottom.sublist(0, 2 * _segSamples + 1)),
-          (top.sublist(2 * _segSamples), bottom.sublist(2 * _segSamples)),
+          (top.sublist(0, kMid * _segSamples + 1), bottom.sublist(0, kMid * _segSamples + 1)),
+          (top.sublist(kMid * _segSamples), bottom.sublist(kMid * _segSamples)),
         ]
       : [(top, bottom)];
 
@@ -321,3 +341,16 @@ Future<(Detection, List<Uint8List>)> autoScan(String path) async {
 
 Uint8List _encode(cv.Mat m) =>
     cv.imencode('.jpg', m, params: cv.VecI32.fromList([cv.IMWRITE_JPEG_QUALITY, 92])).$2;
+
+/// isolate에서 실행된다: 저장용 변환. (원본 JPG, 'jpg'|'png', 긴 변 최대 픽셀, JPG 화질)
+Future<Uint8List> transcode((Uint8List, String, int?, int) args) async {
+  final (jpg, ext, maxSide, quality) = args;
+  var img = cv.imdecode(jpg, cv.IMREAD_COLOR);
+  if (maxSide != null) {
+    final s = maxSide / math.max(img.cols, img.rows);
+    if (s < 1) img = cv.resize(img, ((img.cols * s).round(), (img.rows * s).round()), interpolation: cv.INTER_AREA);
+  }
+  return ext == 'png'
+      ? cv.imencode('.png', img).$2
+      : cv.imencode('.jpg', img, params: cv.VecI32.fromList([cv.IMWRITE_JPEG_QUALITY, quality])).$2;
+}

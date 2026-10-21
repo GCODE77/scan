@@ -19,11 +19,12 @@ class CropScreen extends StatefulWidget {
 
 class _CropScreenState extends State<CropScreen> {
   late PageShape _shape = (widget.initial ?? widget.detection.shape).copy();
-  int? _dragging; // 0~4: 위 가장자리, 5~9: 아래 가장자리
+  int? _dragging; // 0~kPts-1: 위 가장자리, 그 다음: 아래 가장자리
 
-  Offset _point(int i) => i < 5 ? _shape.top[i] : _shape.bottom[i - 5];
+  Offset _point(int i) => i < kPts ? _shape.top[i] : _shape.bottom[i - kPts];
 
-  void _setPoint(int i, Offset p) => i < 5 ? _shape.top[i] = p : _shape.bottom[i - 5] = p;
+  void _setPoint(int i, Offset p) =>
+      i < kPts ? _shape.top[i] = p : _shape.bottom[i - kPts] = p;
 
 
   /// 굴곡을 없애고 네 모서리 사이를 곧은 선으로
@@ -183,12 +184,12 @@ class _ShapePainter extends CustomPainter {
           PointMode.polygon, [for (var i = 0; i < t.length; i++) Offset.lerp(t[i], b[i], v)!], guide);
     }
     if (spread) {
-      canvas.drawLine(top[2], bottom[2], line..color = Colors.orangeAccent);
+      canvas.drawLine(top[kMid], bottom[kMid], line..color = Colors.orangeAccent);
     }
     final pts = [...top, ...bottom];
     for (var i = 0; i < pts.length; i++) {
-      final corner = i == 0 || i == 4 || i == 5 || i == 9;
-      final spine = spread && (i == 2 || i == 7);
+      final corner = i == 0 || i == kPts - 1 || i == kPts || i == 2 * kPts - 1;
+      final spine = spread && (i == kMid || i == kPts + kMid);
       final r = i == active ? 15.0 : (corner ? 12.0 : 9.0);
       canvas.drawCircle(pts[i], r, Paint()..color = Colors.white);
       canvas.drawCircle(
