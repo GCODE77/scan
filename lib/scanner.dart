@@ -93,6 +93,26 @@ class _Grad {
     h = g.rows;
     gx = Uint8List.fromList(cv.sobel(g, cv.MatType.CV_32F, 1, 0).data).buffer.asFloat32List();
     gy = Uint8List.fromList(cv.sobel(g, cv.MatType.CV_32F, 0, 1).data).buffer.asFloat32List();
+    _big = big;
+  }
+
+  late final cv.Mat _big;
+
+  /// 흰 종이다운 정도 (밝기 − 3×채도), 처음 쓸 때 계산
+  late final Uint8List white = () {
+    final lab = Uint8List.fromList(cv.cvtColor(_big, cv.COLOR_BGR2Lab).data);
+    final n = w * h, out = Uint8List(n);
+    for (var i = 0; i < n; i++) {
+      final a = lab[i * 3 + 1] - 128.0, b = lab[i * 3 + 2] - 128.0;
+      out[i] = (lab[i * 3] - 3 * math.sqrt(a * a + b * b)).clamp(0, 255).round();
+    }
+    return Uint8List.fromList(
+        cv.gaussianBlur(cv.Mat.fromList(h, w, cv.MatType.CV_8UC1, out), (5, 5), 0).data);
+  }();
+
+  double whiteAt(Offset p) {
+    final x = p.dx.round(), y = p.dy.round();
+    return (x < 0 || y < 0 || x >= w || y >= h) ? 0 : white[y * w + x].toDouble();
   }
 
   late final double s, f; // f = 800 좌표 → 1600 좌표 배율
@@ -998,48 +1018,89 @@ Future<Uint8List> transcode((Uint8List, String, int?, int) args) async {
 }
 
 /// isolate에서 실행된다: 사용자가 놓은 모서리를 근처의 실제 종이 모서리에 붙인다.
-/// (원본 JPG, 네 모서리 [좌상·우상·우하·좌하] 원본 좌표, 옮긴 모서리 번호) → 붙을 위치 (못 찾으면 null)
-Future<Offset?> snapCorner((Uint8List, List<Offset>, int) args) async {
-  final (jpg, quad, idx) = args;
+/// (원본 JPG, 네 모서리 [좌상·우상·우하·좌하] 원본 좌표, 옮긴 모서리 번호들) → 모서리 번호별 붙을 위치
+Future<Map<int, Offset>> snapCorners((Uint8List, List<Offset>, List<int>) args) async {
+  final (jpg, quad, idxs) = args;
   final img = cv.imdecode(jpg, cv.IMREAD_COLOR);
-  if (img.isEmpty) return null;
-  final g = _Grad(img, 1.0); // f = 1600 배율 (원본 → 고해상도)
+  if (img.isEmpty) return {};
+  final g = _Grad(img, 1.0); // 원본 → 고해상도(긴 변 1600)
   final q = [for (final p in quad) p * g.s];
+  final out = <int, Offset>{};
+  for (final i in idxs) {
+    // 붙은 위치로 다시 맞추기를 몇 번 반복하면 더 정확해진다
+    for (var it = 0; it < 3; it++) {
+      final p = _snapOne(g, q, i);
+      if (p == null) break;
+      final moved = (p - q[i]).distance;
+      q[i] = p; // 다음 모서리는 붙은 위치 기준으로
+      out[i] = p / g.s;
+      if (moved < 1.5) break;
+    }
+  }
+  return out;
+}
+
+Offset? _snapOne(_Grad g, List<Offset> q, int idx) {
   final c = q[idx];
   final center = q.reduce((a, b) => a + b) / 4;
   final diag = ((q[2] - q[0]).distance + (q[3] - q[1]).distance) / 2;
 
-  // 이 모서리에서 뻗은 두 변을 모서리 가까운 쪽만 보고 다시 맞춘다
+  // 종이 밝기 기준: 사각형 안쪽(가운데 60%)의 흰 정도 중 밝은 쪽(상위 25%)의 80%
+  final samples = <double>[];
+  for (var i = 0; i <= 20; i++) {
+    for (var j = 0; j <= 20; j++) {
+      final top = Offset.lerp(q[0], q[1], i / 20)!, bot = Offset.lerp(q[3], q[2], i / 20)!;
+      final p = Offset.lerp(top, bot, j / 20)!;
+      samples.add(g.whiteAt(center + (p - center) * 0.6));
+    }
+  }
+  samples.sort();
+  final paperT = 0.8 * samples[(samples.length * 0.75).floor()];
+
+  // 이 모서리에서 이웃 모서리까지 변 전체를 보며 실제 테두리를 찾아 직선으로
   (Offset, Offset)? edgeNear(Offset other) {
     final d = other - c, len = d.distance;
     if (len < 10) return null;
     final t = d / len;
     var n = Offset(-t.dy, t.dx);
-    final mid = c + d * 0.25;
+    final mid = c + d * 0.3;
     if ((center - mid).dx * n.dx + (center - mid).dy * n.dy < 0) n = -n;
-    final band = math.max(10, (diag * 0.05).round()); // 대충 놓아도 찾도록 넉넉히
+    final band = math.max(14, (diag * 0.10).round()); // 대충 놓아도 찾도록 넓게
     final pts = <Offset>[];
-    for (var k = 0; k < 30; k++) {
-      final p = c + d * (0.04 + 0.4 * k / 29);
-      Offset? best;
-      var bv = 30.0;
-      for (var j = -band; j <= band; j++) {
-        final x = (p.dx + n.dx * j).round(), y = (p.dy + n.dy * j).round();
-        if (x < 1 || y < 1 || x >= g.w - 1 || y >= g.h - 1) continue;
-        final v = g.gx[y * g.w + x] * n.dx + g.gy[y * g.w + x] * n.dy; // 안쪽이 밝아지는 경계
-        if (v > bv) {
-          bv = v;
-          best = Offset(x.toDouble(), y.toDouble());
+    for (var k = 0; k < 40; k++) {
+      final p = c + d * (0.03 + 0.92 * k / 39);
+      // 바깥 → 안쪽으로 걸으며 '안쪽은 종이처럼 희고 바깥은 종이가 아닌' 첫 경계 = 종이 테두리
+      // (안쪽 큰 글씨, 바깥 벽 타일 줄눈, 옆에 붙은 다른 종이에 속지 않게)
+      final prof = [for (var j = -band - 8; j <= band + 8; j++) g.whiteAt(p + n * j.toDouble())];
+      double mean(int a, int b) {
+        var s = 0.0;
+        for (var i = a; i < b; i++) {
+          s += prof[i];
+        }
+        return s / (b - a);
+      }
+
+      for (var i = 8; i < prof.length - 8; i++) {
+        final inside = mean(i + 2, i + 7), outside = mean(i - 6, i - 1);
+        if (inside > paperT && outside < paperT - 25 && inside - outside > 35) {
+          pts.add(p + n * (i - band - 8).toDouble());
+          break;
         }
       }
-      if (best != null) pts.add(best);
     }
-    return pts.length < 8 ? null : _fitLine(pts);
+    return pts.length < 10 ? null : _fitLine(pts);
   }
 
   final l1 = edgeNear(q[(idx + 3) % 4]), l2 = edgeNear(q[(idx + 1) % 4]);
-  if (l1 == null || l2 == null) return null;
-  final p = _intersect(l1, l2);
-  if (p == null || (p - c).distance > diag * 0.08) return null;
-  return p / g.s;
+  Offset? p;
+  if (l1 != null && l2 != null) {
+    p = _intersect(l1, l2);
+  } else if (l1 != null || l2 != null) {
+    // 한 변만 찾았으면 그 선 위의 가장 가까운 점으로
+    final (m, dir) = (l1 ?? l2)!;
+    final along = (c - m).dx * dir.dx + (c - m).dy * dir.dy;
+    p = m + dir * along;
+  }
+  if (p == null || (p - c).distance > diag * 0.15) return null;
+  return p;
 }

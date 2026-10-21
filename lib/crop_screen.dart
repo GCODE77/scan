@@ -41,7 +41,7 @@ class _CropScreenState extends State<CropScreen> {
     if (corner == null) return;
     final seq = ++_snapSeq;
     final quad = [_shape.top.first, _shape.top.last, _shape.bottom.last, _shape.bottom.first];
-    final p = await compute(snapCorner, (_jpg, quad, corner));
+    final p = (await compute(snapCorners, (_jpg, quad, [corner])))[corner];
     // 그 사이 다른 점을 잡았으면 무시
     if (!mounted || p == null || seq != _snapSeq || _dragging != null) return;
     HapticFeedback.selectionClick();
@@ -51,6 +51,21 @@ class _CropScreenState extends State<CropScreen> {
     });
     await Future.delayed(const Duration(milliseconds: 700));
     if (mounted && seq == _snapSeq) setState(() => _snapped = null);
+  }
+
+  /// 네 모서리를 한꺼번에 종이 모서리에 붙인다 (자동 인식 버튼)
+  Future<void> _snapAll() async {
+    final seq = ++_snapSeq;
+    final quad = [_shape.top.first, _shape.top.last, _shape.bottom.last, _shape.bottom.first];
+    final res = await compute(snapCorners, (_jpg, quad, [0, 1, 2, 3]));
+    if (!mounted || seq != _snapSeq || _dragging != null || res.isEmpty) return;
+    HapticFeedback.selectionClick();
+    const handleOf = {0: 0, 1: kPts - 1, 2: 2 * kPts - 1, 3: kPts};
+    setState(() {
+      for (final e in res.entries) {
+        _setPoint(handleOf[e.key]!, e.value);
+      }
+    });
   }
 
   /// 점 하나를 옮기면 그 변 전체를 자연스럽게 다시 그린다.
@@ -182,7 +197,10 @@ class _CropScreenState extends State<CropScreen> {
               _QuickTool(
                 icon: Icons.auto_fix_high_rounded,
                 label: '자동 인식',
-                onTap: () => setState(() => _shape = d.shape.copy()),
+                onTap: () {
+                  setState(() => _shape = d.shape.copy());
+                  _snapAll();
+                },
               ),
               _QuickTool(
                 icon: Icons.fullscreen_rounded,
