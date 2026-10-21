@@ -95,7 +95,8 @@ class Store {
       final flat = await File('${dir.path}/flat_$id.jpg').readAsBytes();
       final p = ScanPage(det: det, shape: _shapeFrom(pj['shape']), part: pj['part'], flat: flat, id: id)
         ..mode = ScanMode.values.byName(pj['mode'])
-        ..quarterTurns = pj['turns'];
+        ..quarterTurns = pj['turns']
+        ..strength = (pj['strength'] as num?)?.toDouble() ?? 1;
       final pageFile = File('${dir.path}/page_$id.jpg');
       if (await pageFile.exists()) p.jpg = await pageFile.readAsBytes();
       if (pj['ocr'] != null) {
@@ -173,6 +174,7 @@ class Store {
             'part': p.part,
             'mode': p.mode.name,
             'turns': p.quarterTurns,
+            'strength': p.strength,
             'ocr': p.ocr == null
                 ? null
                 : [

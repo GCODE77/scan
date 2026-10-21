@@ -43,6 +43,9 @@ class ScanPage {
   Uint8List flat;
   ScanMode mode = ScanMode.original;
   int quarterTurns = 0;
+
+  /// 필터 강도 0~1
+  double strength = 1;
   Uint8List jpg;
   OcrResult? ocr;
 
@@ -50,7 +53,7 @@ class ScanPage {
   Future<void> render() async {
     jpg = mode == ScanMode.original && quarterTurns % 4 == 0
         ? flat
-        : await compute(renderPage, (flat, mode, quarterTurns, null));
+        : await compute(renderPage, (flat, mode, quarterTurns, null, strength));
     ocr = null;
   }
 }
@@ -64,15 +67,21 @@ class Ocr {
   static final _recognizer = TextRecognizer(script: TextRecognitionScript.korean);
   static var _seq = 0;
 
-  static Future<OcrResult> recognize(Uint8List jpg) async {
+  /// 페이지 글자 인식. 필터를 입힌 사진 대신 '그림자 없앤 회색' 이미지로 읽어서 정확도를 높이고,
+  /// 결과 위치는 페이지 이미지(jpg) 좌표로 돌려준다.
+  static Future<OcrResult> recognize(ScanPage page) async {
+    final (img, scale) = await compute(ocrImage, (page.flat, page.quarterTurns));
     final dir = await getTemporaryDirectory();
-    final file = File('${dir.path}/ocr_${_seq++}.jpg');
-    await file.writeAsBytes(jpg);
+    final file = File('${dir.path}/ocr_${_seq++}.png');
+    await file.writeAsBytes(img);
     try {
       final result = await _recognizer.processImage(InputImage.fromFilePath(file.path));
+      Rect back(Rect r) =>
+          Rect.fromLTRB(r.left / scale, r.top / scale, r.right / scale, r.bottom / scale);
       return OcrResult([
         for (final block in result.blocks)
-          for (final line in block.lines) OcrLine(line.text, line.boundingBox),
+          for (final line in block.lines)
+            if (line.text.trim().isNotEmpty) OcrLine(line.text, back(line.boundingBox)),
       ]);
     } finally {
       file.delete().ignore();

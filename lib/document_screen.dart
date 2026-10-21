@@ -71,7 +71,7 @@ class _DocumentScreenState extends State<DocumentScreen> {
       _ocrQueue = _ocrQueue.then((_) async {
         final jpg = p.jpg;
         try {
-          final r = await Ocr.recognize(jpg);
+          final r = await Ocr.recognize(p);
           if (identical(p.jpg, jpg)) p.ocr = r; // 그 사이 필터를 바꿨으면 버린다
         } catch (e) {
           p.ocr = OcrResult([]);

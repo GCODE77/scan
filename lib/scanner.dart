@@ -58,14 +58,17 @@ class Detection {
 }
 
 /// 필터 (색 처리 방식). 기본은 원본.
-enum ScanMode { original, bright, magic, gray, bw }
+enum ScanMode { original, bright, magic, shadow, gray, grayscale, bw, invert }
 
 const scanModeLabels = {
   ScanMode.original: '원본',
   ScanMode.bright: '밝게하기',
   ScanMode.magic: '매직 컬러',
+  ScanMode.shadow: '음영 제거',
   ScanMode.gray: '흑백',
+  ScanMode.grayscale: '그레이스케일',
   ScanMode.bw: '스캔 B/W',
+  ScanMode.invert: '반전',
 };
 
 // ───────────────────────── 검출 ─────────────────────────
@@ -109,6 +112,19 @@ class _Grad {
     return Uint8List.fromList(
         cv.gaussianBlur(cv.Mat.fromList(h, w, cv.MatType.CV_8UC1, out), (5, 5), 0).data);
   }();
+
+  /// 흐리게 한 Lab 색 (색 종이 자석용), 처음 쓸 때 계산
+  late final Uint8List lab =
+      Uint8List.fromList(cv.gaussianBlur(cv.cvtColor(_big, cv.COLOR_BGR2Lab), (5, 5), 0).data);
+
+  /// 종이 색과의 거리 (밝기는 그림자 때문에 절반만 반영). 사진 밖은 아주 멀게.
+  double distAt(Offset p, List<double> c) {
+    final x = p.dx.round(), y = p.dy.round();
+    if (x < 0 || y < 0 || x >= w || y >= h) return 255;
+    final i = (y * w + x) * 3;
+    final dl = (lab[i] - c[0]) * 0.5, da = lab[i + 1] - c[1], db = lab[i + 2] - c[2];
+    return math.sqrt(dl * dl + da * da + db * db);
+  }
 
   double whiteAt(Offset p) {
     final x = p.dx.round(), y = p.dy.round();
@@ -945,20 +961,56 @@ cv.Mat _dewarp(cv.Mat img, List<Offset> top, List<Offset> bottom) {
 }
 
 /// 색 처리.
-cv.Mat _applyMode(cv.Mat out, ScanMode mode) {
-  if (mode == ScanMode.original) return out;
-  if (mode == ScanMode.bright) return out.convertTo(cv.MatType.CV_8UC3, alpha: 1.15, beta: 25);
-  // 배경(종이) 밝기를 추정해서 나누면 그림자와 조명 얼룩이 사라진다
+/// 필터 적용. [strength] 0~1: 0이면 원본, 1이면 필터 최대.
+cv.Mat _applyMode(cv.Mat out, ScanMode mode, [double strength = 1]) {
+  if (mode == ScanMode.original || strength <= 0) return out;
+  if (mode == ScanMode.bright) {
+    return out.convertTo(cv.MatType.CV_8UC3, alpha: 1 + 0.3 * strength, beta: 50 * strength);
+  }
   final gray = cv.cvtColor(out, cv.COLOR_BGR2GRAY);
-  final k = cv.getStructuringElement(cv.MORPH_RECT, (7, 7));
-  final bg = cv.medianBlur(cv.dilate(gray, k), 21);
-  return switch (mode) {
-    ScanMode.magic => cv.divide(out, cv.cvtColor(bg, cv.COLOR_GRAY2BGR), scale: 255),
-    ScanMode.gray => cv.divide(gray, bg, scale: 255),
-    ScanMode.bw => cv.adaptiveThreshold(cv.divide(gray, bg, scale: 255), 255,
-        cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, 31, 10),
+  // 배경(종이) 밝기를 추정해서 나누면 그림자와 조명 얼룩이 사라진다
+  cv.Mat bgOf(cv.Mat m) =>
+      cv.medianBlur(cv.dilate(m, cv.getStructuringElement(cv.MORPH_RECT, (7, 7))), 21);
+  final f = switch (mode) {
+    ScanMode.magic => () {
+        final flat = cv.divide(out, cv.cvtColor(bgOf(gray), cv.COLOR_GRAY2BGR), scale: 255);
+        // 매직: 그림자 제거 + 대비·채도를 살짝 올림
+        return flat.convertTo(cv.MatType.CV_8UC3, alpha: 1.25, beta: -45);
+      }(),
+    ScanMode.shadow => () {
+        // 색은 그대로 두고 채널마다 그림자만 걷어낸다
+        final ch = cv.split(out);
+        final fixed = [for (final c in ch) cv.divide(c, bgOf(c), scale: 245)];
+        return cv.merge(cv.VecMat.fromList(fixed));
+      }(),
+    ScanMode.gray => cv.cvtColor(cv.divide(gray, bgOf(gray), scale: 255), cv.COLOR_GRAY2BGR),
+    ScanMode.grayscale => cv.cvtColor(gray, cv.COLOR_GRAY2BGR),
+    ScanMode.bw => cv.cvtColor(
+        cv.adaptiveThreshold(cv.divide(gray, bgOf(gray), scale: 255), 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv.THRESH_BINARY, 31, 10),
+        cv.COLOR_GRAY2BGR),
+    ScanMode.invert => cv.bitwiseNOT(out),
     ScanMode.original || ScanMode.bright => out,
   };
+  if (strength >= 0.999) return f;
+  // 강도: 원본과 섞는다
+  return cv.addWeighted(out, 1 - strength, f, strength, 0);
+}
+
+/// 글자 인식(OCR)용 이미지: 그림자 제거한 회색, 긴 변 2400px 이하
+Future<(Uint8List, double)> ocrImage((Uint8List, int) args) async {
+  final (flat, quarterTurns) = args;
+  var img = cv.imdecode(flat, cv.IMREAD_COLOR);
+  final s = math.min(1.0, 2400 / math.max(img.cols, img.rows));
+  if (s < 1) img = cv.resize(img, ((img.cols * s).round(), (img.rows * s).round()), interpolation: cv.INTER_AREA);
+  final gray = cv.cvtColor(img, cv.COLOR_BGR2GRAY);
+  final bg = cv.medianBlur(cv.dilate(gray, cv.getStructuringElement(cv.MORPH_RECT, (7, 7))), 21);
+  var out = cv.divide(gray, bg, scale: 255);
+  final r = quarterTurns % 4;
+  if (r != 0) {
+    out = cv.rotate(out, const [0, cv.ROTATE_90_CLOCKWISE, cv.ROTATE_180, cv.ROTATE_90_COUNTERCLOCKWISE][r]);
+  }
+  return (cv.imencode('.png', out).$2, s);
 }
 
 /// isolate에서 실행된다: 윤곽대로 편 원본 색 JPG 목록 (양면이면 왼쪽, 오른쪽 2장).
@@ -979,14 +1031,14 @@ Future<List<Uint8List>> warpFlat((Uint8List, PageShape) args) async {
 }
 
 /// isolate에서 실행된다: 편 이미지에 필터·회전 적용. maxSide를 주면 미리보기용으로 작게.
-Future<Uint8List> renderPage((Uint8List, ScanMode, int, int?) args) async {
-  final (flat, mode, quarterTurns, maxSide) = args;
+Future<Uint8List> renderPage((Uint8List, ScanMode, int, int?, double) args) async {
+  final (flat, mode, quarterTurns, maxSide, strength) = args;
   var img = cv.imdecode(flat, cv.IMREAD_COLOR);
   if (maxSide != null) {
     final s = maxSide / math.max(img.cols, img.rows);
     if (s < 1) img = cv.resize(img, ((img.cols * s).round(), (img.rows * s).round()), interpolation: cv.INTER_AREA);
   }
-  img = _applyMode(img, mode);
+  img = _applyMode(img, mode, strength);
   final r = quarterTurns % 4;
   if (r != 0) {
     img = cv.rotate(img, const [0, cv.ROTATE_90_CLOCKWISE, cv.ROTATE_180, cv.ROTATE_90_COUNTERCLOCKWISE][r]);
@@ -1040,22 +1092,59 @@ Future<Map<int, Offset>> snapCorners((Uint8List, List<Offset>, List<int>) args) 
   return out;
 }
 
-Offset? _snapOne(_Grad g, List<Offset> q, int idx) {
+Offset? _snapOne(_Grad g, List<Offset> q, int idx) =>
+    _snapBy(g, q, idx, byColor: true) ?? _snapBy(g, q, idx, byColor: false);
+
+/// [byColor]: 종이 자체의 색 기준 (흰색·색 종이 모두). 아니면 '흰 종이' 기준.
+Offset? _snapBy(_Grad g, List<Offset> q, int idx, {required bool byColor}) {
   final c = q[idx];
   final center = q.reduce((a, b) => a + b) / 4;
   final diag = ((q[2] - q[0]).distance + (q[3] - q[1]).distance) / 2;
 
-  // 종이 밝기 기준: 사각형 안쪽(가운데 60%)의 흰 정도 중 밝은 쪽(상위 25%)의 80%
-  final samples = <double>[];
+  // 사각형 안쪽(가운데 60%)에서 표본
+  final inner = <Offset>[];
   for (var i = 0; i <= 20; i++) {
     for (var j = 0; j <= 20; j++) {
       final top = Offset.lerp(q[0], q[1], i / 20)!, bot = Offset.lerp(q[3], q[2], i / 20)!;
-      final p = Offset.lerp(top, bot, j / 20)!;
-      samples.add(g.whiteAt(center + (p - center) * 0.6));
+      inner.add(center + (Offset.lerp(top, bot, j / 20)! - center) * 0.6);
     }
   }
-  samples.sort();
-  final paperT = 0.8 * samples[(samples.length * 0.75).floor()];
+
+  // 판정 기준: 값이 '종이다울수록 크게' 나오는 함수와 문턱
+  late final double Function(Offset) paperness;
+  late final double inT, gap, minDiff;
+  if (byColor) {
+    // 종이 색 = 안쪽에서 밝은 쪽 절반의 중앙값 (글씨 제외)
+    final px = <List<double>>[];
+    for (final p in inner) {
+      final x = p.dx.round(), y = p.dy.round();
+      if (x < 0 || y < 0 || x >= g.w || y >= g.h) continue;
+      final i = (y * g.w + x) * 3;
+      px.add([g.lab[i].toDouble(), g.lab[i + 1].toDouble(), g.lab[i + 2].toDouble()]);
+    }
+    if (px.length < 20) return null;
+    px.sort((a, b) => a[0].compareTo(b[0]));
+    final bright = px.sublist(px.length ~/ 2);
+    double med(int k) => (bright.map((e) => e[k]).toList()..sort())[bright.length ~/ 2];
+    final pc = [med(0), med(1), med(2)];
+    final d = bright.map((e) {
+      final dl = (e[0] - pc[0]) * 0.5, da = e[1] - pc[1], db = e[2] - pc[2];
+      return math.sqrt(dl * dl + da * da + db * db);
+    }).toList()
+      ..sort();
+    final dlim = math.max(12.0, d[(d.length * 0.75).floor()] * 1.3);
+    // 거리 → '종이다움' (작을수록 종이)
+    paperness = (p) => -g.distAt(p, pc);
+    inT = -dlim;
+    gap = 15;
+    minDiff = 20;
+  } else {
+    final w = inner.map(g.whiteAt).toList()..sort();
+    paperness = g.whiteAt;
+    inT = 0.8 * w[(w.length * 0.75).floor()];
+    gap = 25;
+    minDiff = 35;
+  }
 
   // 이 모서리에서 이웃 모서리까지 변 전체를 보며 실제 테두리를 찾아 직선으로
   (Offset, Offset)? edgeNear(Offset other) {
@@ -1071,7 +1160,7 @@ Offset? _snapOne(_Grad g, List<Offset> q, int idx) {
       final p = c + d * (0.03 + 0.92 * k / 39);
       // 바깥 → 안쪽으로 걸으며 '안쪽은 종이처럼 희고 바깥은 종이가 아닌' 첫 경계 = 종이 테두리
       // (안쪽 큰 글씨, 바깥 벽 타일 줄눈, 옆에 붙은 다른 종이에 속지 않게)
-      final prof = [for (var j = -band - 8; j <= band + 8; j++) g.whiteAt(p + n * j.toDouble())];
+      final prof = [for (var j = -band - 8; j <= band + 8; j++) paperness(p + n * j.toDouble())];
       double mean(int a, int b) {
         var s = 0.0;
         for (var i = a; i < b; i++) {
@@ -1082,7 +1171,7 @@ Offset? _snapOne(_Grad g, List<Offset> q, int idx) {
 
       for (var i = 8; i < prof.length - 8; i++) {
         final inside = mean(i + 2, i + 7), outside = mean(i - 6, i - 1);
-        if (inside > paperT && outside < paperT - 25 && inside - outside > 35) {
+        if (inside > inT && outside < inT - gap && inside - outside > minDiff) {
           pts.add(p + n * (i - band - 8).toDouble());
           break;
         }

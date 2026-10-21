@@ -44,20 +44,32 @@ class _EditorScreenState extends State<EditorScreen> {
   Future<Map<ScanMode, Uint8List>> _thumbsFor(ScanPage p) => _thumbs[p.flat] ??= _makeThumbs(p.flat);
 
   static Future<Map<ScanMode, Uint8List>> _makeThumbs(Uint8List flat) async => {
-        for (final m in ScanMode.values) m: await compute(renderPage, (flat, m, 0, 240)),
+        for (final m in ScanMode.values) m: await compute(renderPage, (flat, m, 0, 240, 1.0)),
       };
 
   void _setFilter(ScanMode m, {bool all = false}) => _work(() async {
         for (final p in all ? _pages : [_page]) {
           if (p.mode == m) continue;
           p.mode = m;
+          p.strength = 1; // 새 필터는 최대 강도부터
           await p.render();
         }
       });
 
-  void _rotate() => _work(() async {
-        _page.quarterTurns -= 1; // 왼쪽(반시계)으로 90도
+  /// 90도 회전 (-1: 왼쪽, 1: 오른쪽)
+  void _rotate(int dir) => _work(() async {
+        HapticFeedback.selectionClick();
+        _page.quarterTurns += dir;
         await _page.render();
+      });
+
+  /// 슬라이더를 움직이는 동안 보여 줄 값 (손을 떼면 적용)
+  double? _strengthDrag;
+
+  void _setStrength(double v) => _work(() async {
+        _page.strength = v;
+        await _page.render();
+        _strengthDrag = null;
       });
 
   /// 같은 사진에서 나온 페이지들(양면이면 2장)의 위치
@@ -114,7 +126,7 @@ class _EditorScreenState extends State<EditorScreen> {
   Future<void> _extractText() async {
     final p = _page;
     if (p.ocr == null) {
-      await _work(() async => p.ocr = await Ocr.recognize(p.jpg));
+      await _work(() async => p.ocr = await Ocr.recognize(p));
     }
     if (!mounted) return;
     final text = p.ocr!.text;
@@ -242,6 +254,33 @@ class _EditorScreenState extends State<EditorScreen> {
             ),
           ]),
         ),
+        // 필터 강도 (원본이 아닐 때만)
+        AnimatedSize(
+          duration: const Duration(milliseconds: 150),
+          child: _page.mode == ScanMode.original
+              ? const SizedBox(width: double.infinity)
+              : Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 0, 16, 0),
+                  child: Row(children: [
+                    Text('${scanModeLabels[_page.mode]} 강도',
+                        style: const TextStyle(color: Colors.white70, fontSize: 12)),
+                    Expanded(
+                      child: Slider(
+                        value: _strengthDrag ?? _page.strength,
+                        divisions: 20,
+                        onChanged: _busy ? null : (v) => setState(() => _strengthDrag = v),
+                        onChangeEnd: _busy ? null : _setStrength,
+                      ),
+                    ),
+                    SizedBox(
+                      width: 40,
+                      child: Text('${((_strengthDrag ?? _page.strength) * 100).round()}%',
+                          textAlign: TextAlign.right,
+                          style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w700)),
+                    ),
+                  ]),
+                ),
+        ),
         // 필터 줄
         SizedBox(
           height: 104,
@@ -302,8 +341,9 @@ class _EditorScreenState extends State<EditorScreen> {
             padding: const EdgeInsets.fromLTRB(4, 8, 12, 8),
             child: Row(children: [
               _Tool(Icons.camera_alt_outlined, '다시 찍기', _busy ? null : _retake),
-              _Tool(Icons.rotate_left, '왼쪽', _busy ? null : _rotate),
-              _Tool(Icons.crop, '사진 자르기', _busy ? null : _crop),
+              _Tool(Icons.rotate_left, '왼쪽', _busy ? null : () => _rotate(-1)),
+              _Tool(Icons.rotate_right, '오른쪽', _busy ? null : () => _rotate(1)),
+              _Tool(Icons.crop, '자르기', _busy ? null : _crop),
               _Tool(Icons.text_fields, '텍스트 추출', _busy ? null : _extractText),
               const SizedBox(width: 4),
               FilledButton(
