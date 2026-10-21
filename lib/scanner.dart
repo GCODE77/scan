@@ -97,7 +97,13 @@ class _Grad {
     gx = Uint8List.fromList(cv.sobel(g, cv.MatType.CV_32F, 1, 0).data).buffer.asFloat32List();
     gy = Uint8List.fromList(cv.sobel(g, cv.MatType.CV_32F, 0, 1).data).buffer.asFloat32List();
     _big = big;
+    _gray = g;
   }
+
+  late final cv.Mat _gray;
+
+  /// 테두리 선 (L자 모서리 찾기용), 처음 쓸 때 계산
+  late final cv.Mat edges = cv.canny(_gray, 40, 120);
 
   late final cv.Mat _big;
 
@@ -1080,7 +1086,7 @@ Future<Map<int, Offset>> snapCorners((Uint8List, List<Offset>, List<int>) args) 
   final out = <int, Offset>{};
   for (final i in idxs) {
     // 붙은 위치로 다시 맞추기를 몇 번 반복하면 더 정확해진다
-    for (var it = 0; it < 3; it++) {
+    for (var it = 0; it < 1; it++) {
       final p = _snapOne(g, q, i);
       if (p == null) break;
       final moved = (p - q[i]).distance;
@@ -1092,8 +1098,85 @@ Future<Map<int, Offset>> snapCorners((Uint8List, List<Offset>, List<int>) args) 
   return out;
 }
 
-Offset? _snapOne(_Grad g, List<Offset> q, int idx) =>
-    _snapBy(g, q, idx, byColor: true) ?? _snapBy(g, q, idx, byColor: false);
+/// 세 가지 방법으로 모서리 후보를 찾아 '투표'한다.
+/// 1) L자: 곧은 선분 두 개가 실제로 꺾여 만나는 점 (색과 무관, 가장 정밀)
+/// 2) 종이 색 경계  3) 흰 종이 경계
+/// 두 방법 이상이 같은 자리를 가리키면 그 자리, 갈리면 종이 색 → L자 → 흰 종이 순서.
+Offset? _snapOne(_Grad g, List<Offset> q, int idx) {
+  final pl = _snapL(g, q, idx);
+  final pc = _snapBy(g, q, idx, byColor: true);
+  final pe = _snapBy(g, q, idx, byColor: false);
+  final cands = [?pl, ?pc, ?pe];
+  for (var i = 0; i < cands.length; i++) {
+    for (var j = 0; j < cands.length; j++) {
+      if (i != j && (cands[i] - cands[j]).distance < 8) return cands[i];
+    }
+  }
+  return pc ?? pl ?? pe;
+}
+
+/// L자 모서리: 모서리 주변에서 두 변 방향의 곧은 선분을 찾아, 끝이 실제로 만나는 교점.
+/// 바깥쪽(종이 끝)에 가까운 모서리를 우대한다 (안쪽 색 띠의 모서리에 속지 않게).
+Offset? _snapL(_Grad g, List<Offset> q, int idx) {
+  final c = q[idx];
+  final center = q.reduce((a, b) => a + b) / 4;
+  final diag = ((q[2] - q[0]).distance + (q[3] - q[1]).distance) / 2;
+  final r = diag * 0.15;
+  final nb = [q[(idx + 3) % 4], q[(idx + 1) % 4]];
+  final area = [c, c + (nb[0] - c) * 0.6, c + (nb[1] - c) * 0.6];
+  final x0 = math.max(0, (area.map((p) => p.dx).reduce(math.min) - r).floor());
+  final y0 = math.max(0, (area.map((p) => p.dy).reduce(math.min) - r).floor());
+  final x1 = math.min(g.w, (area.map((p) => p.dx).reduce(math.max) + r).ceil());
+  final y1 = math.min(g.h, (area.map((p) => p.dy).reduce(math.max) + r).ceil());
+  if (x1 - x0 < 10 || y1 - y0 < 10) return null;
+  final roi = g.edges.region(cv.Rect(x0, y0, x1 - x0, y1 - y0)).clone();
+  final lm = cv.HoughLinesP(roi, 1, math.pi / 180, 30, minLineLength: diag * 0.06, maxLineGap: 10);
+  if (lm.isEmpty) return null;
+  final raw = Uint8List.fromList(lm.data).buffer.asInt32List();
+  final segs = <(Offset, Offset)>[
+    for (var i = 0; i + 3 < raw.length; i += 4)
+      (Offset(raw[i] + x0.toDouble(), raw[i + 1] + y0.toDouble()),
+          Offset(raw[i + 2] + x0.toDouble(), raw[i + 3] + y0.toDouble())),
+  ];
+
+  double segDist(Offset p, Offset a, Offset b) {
+    final ab = b - a, l2 = ab.dx * ab.dx + ab.dy * ab.dy;
+    final t = l2 == 0 ? 0.0 : (((p - a).dx * ab.dx + (p - a).dy * ab.dy) / l2).clamp(0.0, 1.0);
+    return (p - (a + ab * t)).distance;
+  }
+
+  final cands = [<(Offset, Offset)>[], <(Offset, Offset)>[]];
+  for (var e = 0; e < 2; e++) {
+    final d = nb[e] - c;
+    final angE = math.atan2(d.dy, d.dx);
+    for (final (a, b) in segs) {
+      final v = b - a;
+      var da = (math.atan2(v.dy, v.dx) - angE + math.pi / 2) % math.pi - math.pi / 2;
+      if (da.abs() > 18 * math.pi / 180) continue;
+      final mid = (a + b) / 2;
+      if (segDist(mid, c, nb[e]) > r && (mid - c).distance > r * 2) continue;
+      cands[e].add((a, b));
+    }
+  }
+  Offset? best;
+  var bs = double.negativeInfinity;
+  for (final (a1, b1) in cands[0]) {
+    for (final (a2, b2) in cands[1]) {
+      final p = _intersect((a1, b1 - a1), (a2, b2 - a2));
+      if (p == null || (p - c).distance > r) continue;
+      final g1 = segDist(p, a1, b1), g2 = segDist(p, a2, b2);
+      if (g1 > diag * 0.04 || g2 > diag * 0.04) continue; // 끝이 만나야 진짜 모서리
+      final l1 = (b1 - a1).distance, l2 = (b2 - a2).distance;
+      final outward = (p - center).distance - (c - center).distance;
+      final score = math.min(l1, l2) + 0.5 * (l1 + l2) - 2 * (g1 + g2) - 0.6 * (p - c).distance + 1.5 * outward;
+      if (score > bs) {
+        bs = score;
+        best = p;
+      }
+    }
+  }
+  return best;
+}
 
 /// [byColor]: 종이 자체의 색 기준 (흰색·색 종이 모두). 아니면 '흰 종이' 기준.
 Offset? _snapBy(_Grad g, List<Offset> q, int idx, {required bool byColor}) {
