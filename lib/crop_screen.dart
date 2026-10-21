@@ -38,29 +38,11 @@ class _CropScreenState extends State<CropScreen> {
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
-        title: const Text('사진 자르기'),
-        actions: [
-          IconButton(
-            tooltip: '곧게 (굴곡 없애기)',
-            icon: const Icon(Icons.straighten),
-            onPressed: _straighten,
-          ),
-          IconButton(
-            tooltip: '전체 선택',
-            icon: const Icon(Icons.fullscreen),
-            onPressed: () => setState(() => _shape = PageShape.quad([
-                  Offset.zero,
-                  Offset(d.width.toDouble(), 0),
-                  Offset(d.width.toDouble(), d.height.toDouble()),
-                  Offset(0, d.height.toDouble()),
-                ], _shape.spread)),
-          ),
-          IconButton(
-            tooltip: '자동 검출로 되돌리기',
-            icon: const Icon(Icons.auto_fix_high),
-            onPressed: () => setState(() => _shape = d.shape.copy(spread: _shape.spread)),
-          ),
-        ],
+        backgroundColor: Colors.black,
+        title: const Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('윤곽 수정'),
+          Text('점을 끌어서 종이 끝에 맞추세요', style: TextStyle(fontSize: 12, color: Colors.white60)),
+        ]),
       ),
       body: Column(
         children: [
@@ -118,23 +100,32 @@ class _CropScreenState extends State<CropScreen> {
               }),
             ),
           ),
+          // 빠른 도구: 이름이 붙은 버튼으로
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 12),
             child: Row(children: [
-              SegmentedButton<bool>(
-                segments: const [
-                  ButtonSegment(value: false, label: Text('한 쪽'), icon: Icon(Icons.description)),
-                  ButtonSegment(value: true, label: Text('양면'), icon: Icon(Icons.menu_book)),
-                ],
-                selected: {_shape.spread},
-                onSelectionChanged: (v) => setState(() => _shape = _shape.copy(spread: v.first)),
-                style: const ButtonStyle(
-                    foregroundColor: WidgetStatePropertyAll(Colors.white),
-                    visualDensity: VisualDensity.compact),
+              _QuickTool(
+                icon: Icons.auto_fix_high_rounded,
+                label: '자동 인식',
+                onTap: () => setState(() => _shape = d.shape.copy()),
               ),
-              const Spacer(),
-              Text(_shape.spread ? '가운데 점 = 제본선' : '파란 점을 끌어 굴곡 맞춤',
-                  style: const TextStyle(color: Colors.white60, fontSize: 12)),
+              _QuickTool(
+                icon: Icons.fullscreen_rounded,
+                label: '사진 전체',
+                onTap: () => setState(() => _shape = PageShape.quad([
+                      Offset.zero,
+                      Offset(d.width.toDouble(), 0),
+                      Offset(d.width.toDouble(), d.height.toDouble()),
+                      Offset(0, d.height.toDouble()),
+                    ], false)),
+              ),
+              _QuickTool(icon: Icons.straighten_rounded, label: '굴곡 없이', onTap: _straighten),
+              _QuickTool(
+                icon: _shape.spread ? Icons.menu_book_rounded : Icons.description_outlined,
+                label: _shape.spread ? '양면 → 2장' : '한 장',
+                active: _shape.spread,
+                onTap: () => setState(() => _shape = _shape.copy(spread: !_shape.spread)),
+              ),
             ]),
           ),
           Padding(
@@ -144,8 +135,8 @@ class _CropScreenState extends State<CropScreen> {
               height: 52,
               child: FilledButton.icon(
                 onPressed: () => Navigator.pop(context, _shape),
-                icon: const Icon(Icons.check),
-                label: const Text('적용'),
+                icon: const Icon(Icons.check_rounded),
+                label: Text(_shape.spread ? '이대로 펴기 (2장)' : '이대로 펴기'),
               ),
             ),
           ),
@@ -242,6 +233,34 @@ class _Magnifier extends StatelessWidget {
               child: Image.memory(image, fit: BoxFit.fill, gaplessPlayback: true),
             ),
             const Center(child: Icon(Icons.add, color: Colors.redAccent, size: 28)),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+class _QuickTool extends StatelessWidget {
+  const _QuickTool({required this.icon, required this.label, required this.onTap, this.active = false});
+
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+  final bool active;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = active ? const Color(0xFF4FE3C1) : Colors.white;
+    return Expanded(
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Icon(icon, color: color, size: 24),
+            const SizedBox(height: 4),
+            Text(label, style: TextStyle(color: color, fontSize: 12)),
           ]),
         ),
       ),

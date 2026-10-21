@@ -49,11 +49,12 @@ class _LibraryScreenState extends State<LibraryScreen> {
     if (mounted) setState(() => _docs = docs);
   }
 
-  Future<void> _open(ScanDoc doc, {bool scanFirst = false}) async {
+  Future<void> _open(ScanDoc doc, {bool scanFirst = false, bool gallery = false}) async {
     if (!scanFirst) await Store.load(doc);
     if (!mounted) return;
     await Navigator.push(
-        context, MaterialPageRoute(builder: (_) => DocumentScreen(doc: doc, scanFirst: scanFirst)));
+        context, MaterialPageRoute(
+            builder: (_) => DocumentScreen(doc: doc, scanFirst: scanFirst, galleryFirst: gallery)));
     final count = doc.pages.length;
     // 저장이 끝난 뒤에 메모리에서 내린다. 페이지가 하나도 없는 문서는 보관함에서도 지운다.
     if (count > 0) {
@@ -185,11 +186,25 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   ),
                 ),
       floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
-      floatingActionButton: GradientButton(
-        icon: Icons.document_scanner_rounded,
-        label: '스캔 시작',
-        onTap: () => _open(Store.newDoc(), scanFirst: true),
-      ),
+      // 주 행동: 스캔 시작 · 보조: 갤러리 사진으로 시작
+      floatingActionButton: Row(mainAxisSize: MainAxisSize.min, children: [
+        Material(
+          color: AppColors.card,
+          shape: const CircleBorder(side: BorderSide(color: Colors.white24)),
+          child: IconButton(
+            tooltip: '사진에서 가져오기',
+            padding: const EdgeInsets.all(14),
+            icon: const Icon(Icons.photo_library_rounded),
+            onPressed: () => _open(Store.newDoc(), scanFirst: true, gallery: true),
+          ),
+        ),
+        const SizedBox(width: 12),
+        GradientButton(
+          icon: Icons.document_scanner_rounded,
+          label: '스캔 시작',
+          onTap: () => _open(Store.newDoc(), scanFirst: true),
+        ),
+      ]),
     );
   }
 }
@@ -298,7 +313,7 @@ class _Empty extends StatelessWidget {
               style: TextStyle(fontSize: 24, fontWeight: FontWeight.w800, letterSpacing: -.5)),
           const SizedBox(height: 10),
           const Text(
-            '셔터만 누르세요.\n휘어진 페이지를 반듯하게 펴고, 양면은 나누고,\n글자까지 읽어 드립니다.',
+            '셔터만 누르세요. 휘어진 페이지는 펴고,\n여러 장은 나누고, 글자까지 읽어 드립니다.\n\n갤러리 사진은 왼쪽 아래 버튼으로 가져오세요.',
             textAlign: TextAlign.center,
             style: TextStyle(color: AppColors.muted, height: 1.6),
           ),

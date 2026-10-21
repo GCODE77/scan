@@ -1,7 +1,7 @@
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
-import 'dart:ui' show Offset;
+import 'dart:ui' show Offset, Rect;
 
 import 'package:opencv_dart/opencv_dart.dart' as cv;
 
@@ -71,7 +71,103 @@ const scanModeLabels = {
 // ───────────────────────── 검출 ─────────────────────────
 
 /// isolate에서 실행된다: 사진 경로 → 페이지 윤곽(모서리 + 굴곡) 검출.
-Future<Detection> detectPage(String path) async {
+/// 고해상도(긴 변 1600) 밝기 경사. 모서리 정밀 보정용.
+class _Grad {
+  _Grad(cv.Mat img, double s800) {
+    s = 1600 / math.max(img.cols, img.rows);
+    f = s / s800;
+    final big = cv.resize(img, ((img.cols * s).round(), (img.rows * s).round()), interpolation: cv.INTER_AREA);
+    final g = cv.gaussianBlur(cv.cvtColor(big, cv.COLOR_BGR2GRAY), (5, 5), 0);
+    w = g.cols;
+    h = g.rows;
+    gx = Uint8List.fromList(cv.sobel(g, cv.MatType.CV_32F, 1, 0).data).buffer.asFloat32List();
+    gy = Uint8List.fromList(cv.sobel(g, cv.MatType.CV_32F, 0, 1).data).buffer.asFloat32List();
+  }
+
+  late final double s, f; // f = 800 좌표 → 1600 좌표 배율
+  late final int w, h;
+  late final Float32List gx, gy;
+}
+
+/// 사각형의 네 변을 각각 '안쪽이 밝아지는' 가장 센 경계에 직선으로 맞추고, 교점을 새 모서리로.
+/// 많이 움직이면(오검출) 원래 모서리를 둔다.
+List<Offset> _refineQuad(_Grad g, List<Offset> q800) {
+  final q = [for (final p in q800) p * g.f];
+  final c = q.reduce((a, b) => a + b) / 4;
+  final lines = <(Offset, Offset)?>[];
+  for (var i = 0; i < 4; i++) {
+    final a = q[i], b = q[(i + 1) % 4];
+    final d = b - a, len = d.distance;
+    final t = d / len;
+    var n = Offset(-t.dy, t.dx);
+    final mid = (a + b) / 2;
+    if ((c - mid).dx * n.dx + (c - mid).dy * n.dy < 0) n = -n;
+    final band = math.max(6, (len * 0.04).round());
+    final pts = <Offset>[];
+    for (var k = 0; k < 40; k++) {
+      final p = a + d * (0.08 + 0.84 * k / 39);
+      Offset? best;
+      var bv = 40.0;
+      for (var j = -band; j <= band; j++) {
+        final x = (p.dx + n.dx * j).round(), y = (p.dy + n.dy * j).round();
+        if (x < 1 || y < 1 || x >= g.w - 1 || y >= g.h - 1) continue;
+        final v = g.gx[y * g.w + x] * n.dx + g.gy[y * g.w + x] * n.dy;
+        if (v > bv) {
+          bv = v;
+          best = Offset(x.toDouble(), y.toDouble());
+        }
+      }
+      if (best != null) pts.add(best);
+    }
+    lines.add(pts.length < 10 ? null : _fitLine(pts));
+  }
+  final diag = (q[2] - q[0]).distance;
+  final out = <Offset>[];
+  for (var i = 0; i < 4; i++) {
+    final l1 = lines[(i + 3) % 4], l2 = lines[i];
+    final p = (l1 == null || l2 == null) ? null : _intersect(l1, l2);
+    out.add(p != null && (p - q[i]).distance < 0.06 * diag ? p / g.f : q800[i]);
+  }
+  return out;
+}
+
+/// 점들에 직선 맞춤 (주성분 방향, 튀는 점은 두 번 걸러냄) → (지나는 점, 방향)
+(Offset, Offset) _fitLine(List<Offset> pts) {
+  var p = pts;
+  late Offset m, dir;
+  for (var it = 0; it < 3; it++) {
+    m = p.reduce((a, b) => a + b) / p.length.toDouble();
+    var sxx = 0.0, sxy = 0.0, syy = 0.0;
+    for (final q in p) {
+      final d = q - m;
+      sxx += d.dx * d.dx;
+      sxy += d.dx * d.dy;
+      syy += d.dy * d.dy;
+    }
+    final ang = 0.5 * math.atan2(2 * sxy, sxx - syy);
+    dir = Offset(math.cos(ang), math.sin(ang));
+    if (it == 2) break;
+    double dist(Offset q) => ((q - m).dx * dir.dy - (q - m).dy * dir.dx).abs();
+    final ds = p.map(dist).toList()..sort();
+    final lim = math.max(2.0, ds[ds.length ~/ 2] * 3);
+    final kept = p.where((q) => dist(q) < lim).toList();
+    if (kept.length < 8) break;
+    p = kept;
+  }
+  return (m, dir);
+}
+
+Offset? _intersect((Offset, Offset) l1, (Offset, Offset) l2) {
+  final (p, r) = l1;
+  final (q, s) = l2;
+  final den = r.dx * s.dy - r.dy * s.dx;
+  if (den.abs() < 1e-6) return null;
+  final t = ((q.dx - p.dx) * s.dy - (q.dy - p.dy) * s.dx) / den;
+  return p + r * t;
+}
+
+/// 사진 한 장 → 페이지 윤곽들. 사진 속에 문서가 여러 장이면 각각 하나씩 (읽는 순서).
+Future<List<Detection>> detectPages(String path) async {
   var img = cv.imread(path, flags: cv.IMREAD_COLOR);
   if (img.isEmpty) throw Exception('읽을 수 없는 사진 형식입니다');
   // 글자가 세로로 누워 있으면(문서를 옆으로 찍음) 90도 돌려서 바로 세운다
@@ -86,27 +182,53 @@ Future<Detection> detectPage(String path) async {
   final small = cv.resize(img, ((w * scale).round(), (h * scale).round()), interpolation: cv.INTER_AREA);
   final gray = cv.cvtColor(small, cv.COLOR_BGR2GRAY);
   final blur = cv.gaussianBlur(gray, (7, 7), 0);
-  final paper = _paperMask(blur);
+  final inkAll = cv.adaptiveThreshold(gray, 255, cv.ADAPTIVE_THRESH_MEAN_C, cv.THRESH_BINARY_INV, 25, 15);
 
+  Offset up(Offset p) => Offset((p.dx / scale).clamp(-w * .1, w * 1.1), (p.dy / scale).clamp(-h * .1, h * 1.1));
+  Detection toDet(PageShape s) =>
+      Detection(jpg, w, h, PageShape(s.top.map(up).toList(), s.bottom.map(up).toList(), s.spread), true);
+
+  // 흰 종이(판)를 모두 찾는다. 2장 이상이면 각각 한 페이지 (책 제본선 찾기는 하지 않음)
+  final papers = _findPapers(small);
+  // 평평한 문서의 네 변은 고해상도 밝기 경계에 맞춰 다시 그린다 (모서리 정밀 보정)
+  _Grad? grad;
+  List<Offset> refine(List<Offset> q) => _refineQuad(grad ??= _Grad(img, scale), q);
+  if (papers.length >= 2) {
+    return [
+      for (final (mask, quad) in papers) toDet(_shapeFor(blur, inkAll, mask, refine(quad), findSpine: false)),
+    ];
+  }
+
+  var paper = papers.isNotEmpty ? papers.first : _paperMask(blur);
+  // 사진 안에 통째로 들어온 종이 한 장도 정밀 보정 (가장자리가 사진 밖이거나 휜 책은 제외)
+  if (papers.isNotEmpty) {
+    final (mask, quad) = paper!;
+    final inside = quad.every((p) => p.dx > 3 && p.dy > 3 && p.dx < small.cols - 4 && p.dy < small.rows - 4);
+    if (inside && _findSpine(_Gray(blur), _Gray(inkAll), quad[0], quad[1], quad[2], quad[3]) == null) {
+      paper = (mask, refine(quad));
+    }
+  }
   if (paper == null) {
     // 못 찾으면 사진 전체를 페이지로 (사용자가 원하면 나중에 자르기로 조정)
     final c = [Offset.zero, Offset(w - 1.0, 0), Offset(w - 1.0, h - 1.0), Offset(0, h - 1.0)];
-    return Detection(jpg, w, h, PageShape.quad(c, false), false);
+    return [Detection(jpg, w, h, PageShape.quad(c, false), false)];
   }
-  final (blob, quad0) = paper;
+  return [toDet(_shapeFor(blur, inkAll, paper.$1, paper.$2, findSpine: true))];
+}
 
-  // 잉크 (글자·음표·선): 주변보다 어두운 점
-  var inkM = cv.adaptiveThreshold(gray, 255, cv.ADAPTIVE_THRESH_MEAN_C, cv.THRESH_BINARY_INV, 25, 15);
-  inkM = cv.bitwiseAND(inkM, blob);
+/// 종이 한 장의 윤곽 (작은 이미지 좌표). [findSpine]이면 제본선·잘린 옆 페이지까지 처리.
+PageShape _shapeFor(cv.Mat blur, cv.Mat inkAll, cv.Mat blob, List<Offset> quad0, {required bool findSpine}) {
+  // 잉크 (글자·음표·선): 이 종이 안만
+  var inkM = cv.bitwiseAND(inkAll, blob);
   inkM = cv.morphologyEx(inkM, cv.MORPH_OPEN, cv.getStructuringElement(cv.MORPH_RECT, (2, 2)));
 
   final g = _Gray(blur), ink = _Gray(inkM), m = _Gray(blob);
   var [tl, tr, br, bl] = quad0;
 
   // 1) 제본선: 어두운 골짜기 → 없으면 글자 덩어리 사이 여백
-  final shadowSpine = _findSpine(g, ink, tl, tr, br, bl);
+  final shadowSpine = findSpine ? _findSpine(g, ink, tl, tr, br, bl) : null;
   final byShadow = shadowSpine != null;
-  final spine = shadowSpine ?? _inkGapSpine(ink, tl, tr, br, bl);
+  final spine = findSpine ? (shadowSpine ?? _inkGapSpine(ink, tl, tr, br, bl)) : null;
 
   // 2) 사진 밖으로 잘린 옆 페이지는 버린다. 양쪽이 비슷하면 양면.
   var spread = false;
@@ -139,21 +261,153 @@ Future<Detection> detectPage(String path) async {
     );
   }
 
-  List<Offset> top, bottom;
   if (spread) {
     final (st, sb) = spine!;
     final (lt, lb) = curves(tl, st, sb, bl, kMid + 1);
     final (rt, rb) = curves(st, tr, br, sb, kMid + 1);
     // 두 페이지가 만나는 제본선 점은 평균
-    top = [...lt.sublist(0, kMid), (lt.last + rt.first) / 2, ...rt.sublist(1)];
-    bottom = [...lb.sublist(0, kMid), (lb.last + rb.first) / 2, ...rb.sublist(1)];
-  } else {
-    (top, bottom) = curves(tl, tr, br, bl, kPts);
+    return PageShape(
+      [...lt.sublist(0, kMid), (lt.last + rt.first) / 2, ...rt.sublist(1)],
+      [...lb.sublist(0, kMid), (lb.last + rb.first) / 2, ...rb.sublist(1)],
+      true,
+    );
+  }
+  final (top, bottom) = curves(tl, tr, br, bl, kPts);
+  return PageShape(top, bottom, false);
+}
+
+/// 흰 종이·판들 찾기: 밝고 무채색인 곳 → 덩어리(글씨 구멍 메움) → 색 띠로 갈라진 조각 합치기
+/// → 사각형다움·흰 여백으로 판정. 결과는 (채운 마스크, 네 모서리), 읽는 순서.
+List<(cv.Mat, List<Offset>)> _findPapers(cv.Mat small) {
+  final sw = small.cols, sh = small.rows, n = sw * sh;
+  final lab = Uint8List.fromList(cv.cvtColor(small, cv.COLOR_BGR2Lab).data);
+  final white = Uint8List(n);
+  for (var i = 0; i < n; i++) {
+    final a = lab[i * 3 + 1] - 128.0, b = lab[i * 3 + 2] - 128.0;
+    white[i] = (lab[i * 3] - 3 * math.sqrt(a * a + b * b)).clamp(0, 255).round();
+  }
+  final wm = cv.gaussianBlur(cv.Mat.fromList(sh, sw, cv.MatType.CV_8UC1, white), (5, 5), 0);
+  final wd = Uint8List.fromList(wm.data);
+
+  // 문턱: 자동(Otsu)과 '가장 흰 곳의 72%' 중 높은 쪽 (조금 밝은 벽이 섞이지 않게)
+  final hist = List<int>.filled(256, 0);
+  for (final v in wd) {
+    hist[v]++;
+  }
+  var acc = 0, p99 = 255;
+  for (var v = 0; v < 256; v++) {
+    acc += hist[v];
+    if (acc >= n * 0.99) {
+      p99 = v;
+      break;
+    }
+  }
+  final (otsu, _) = cv.threshold(wm, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+  final t = math.max(otsu, 0.72 * p99);
+  final (_, raw) = cv.threshold(wm, t, 255, cv.THRESH_BINARY);
+  final rawD = Uint8List.fromList(raw.data);
+  final closed = cv.morphologyEx(raw, cv.MORPH_CLOSE, cv.getStructuringElement(cv.MORPH_RECT, (5, 5)));
+  final (contours, _) = cv.findContours(closed, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+  // 조각들 (점, 범위)
+  final parts = <(List<cv.Point>, Rect)>[];
+  for (final c in contours) {
+    if (cv.contourArea(c) < n * 0.004) continue;
+    final pts = c.toList();
+    parts.add((pts, _bounds(pts)));
+  }
+  // 위아래로 나란하고 폭이 거의 같은 조각 = 색 띠로 갈라진 한 장 → 합친다
+  var merged = true;
+  while (merged) {
+    merged = false;
+    outer:
+    for (var i = 0; i < parts.length; i++) {
+      for (var j = 0; j < parts.length; j++) {
+        if (i == j) continue;
+        final a = parts[i].$2, b = parts[j].$2;
+        if (a.top > b.top) continue; // i가 위
+        final ov = math.min(a.right, b.right) - math.max(a.left, b.left);
+        if (ov < 0.85 * math.max(a.width, b.width)) continue;
+        final gap = b.top - a.bottom;
+        if (gap < -5 || gap > 0.6 * math.max(a.height, b.height)) continue;
+        final pts = [...parts[i].$1, ...parts[j].$1];
+        parts[i] = (pts, _bounds(pts));
+        parts.removeAt(j);
+        merged = true;
+        break outer;
+      }
+    }
   }
 
-  // 원본 크기로 (곡선이 사진 밖으로 조금 나가는 것은 허용)
-  Offset up(Offset p) => Offset((p.dx / scale).clamp(-w * .1, w * 1.1), (p.dy / scale).clamp(-h * .1, h * 1.1));
-  return Detection(jpg, w, h, PageShape(top.map(up).toList(), bottom.map(up).toList(), spread), true);
+  final docs = <(double, cv.Mat, List<Offset>, Offset)>[];
+  for (final (pts, _) in parts) {
+    final hull = cv.VecPoint.fromMat(cv.convexHull(cv.VecPoint.fromList(pts)));
+    final area = cv.contourArea(hull);
+    if (area < n * 0.03) continue;
+    final rr = cv.minAreaRect(hull).size;
+    final rect = area / math.max(rr.width * rr.height, 1);
+    final fm = cv.Mat.zeros(sh, sw, cv.MatType.CV_8UC1);
+    cv.drawContours(fm, cv.VecVecPoint.fromList([hull.toList()]), 0, cv.Scalar.all(255), thickness: -1);
+    final k = math.max(3, (math.sqrt(area) * 0.04).round());
+    final inner = cv.erode(fm, cv.getStructuringElement(cv.MORPH_RECT, (k, k)));
+    final fd = Uint8List.fromList(fm.data), id = Uint8List.fromList(inner.data);
+    var inside = 0, whiteIn = 0, ring = 0, whiteRing = 0;
+    for (var i = 0; i < n; i++) {
+      if (fd[i] == 0) continue;
+      inside++;
+      final wt = rawD[i] > 0;
+      if (wt) whiteIn++;
+      if (id[i] == 0) {
+        ring++;
+        if (wt) whiteRing++;
+      }
+    }
+    final fill = whiteIn / math.max(inside, 1);
+    // 진짜 종이는 테두리 안쪽에 흰 여백이 둘려 있다 (사진을 꽉 채운 종이는 잴 수 없으니 통과)
+    final border = ring == 0 ? 1.0 : whiteRing / ring;
+    if (rect < 0.8 || fill < 0.4 || border < 0.6) continue;
+    final quad = _quadOf(hull);
+    docs.add((area, fm, quad, quad.reduce((a, b) => a + b) / 4));
+  }
+  if (docs.isEmpty) return [];
+  final big = docs.map((d) => d.$1).reduce(math.max);
+  docs.removeWhere((d) => d.$1 < big * 0.2);
+  // 읽는 순서: 위→아래 줄, 줄 안에서 왼→오
+  docs.sort((a, b) {
+    final ra = (a.$4.dy / (sh * 0.25)).round(), rb = (b.$4.dy / (sh * 0.25)).round();
+    return ra != rb ? ra.compareTo(rb) : a.$4.dx.compareTo(b.$4.dx);
+  });
+  return [for (final d in docs) (d.$2, d.$3)];
+}
+
+Rect _bounds(List<cv.Point> pts) {
+  var l = pts.first.x, t = pts.first.y, r = l, b = t;
+  for (final p in pts) {
+    l = math.min(l, p.x);
+    t = math.min(t, p.y);
+    r = math.max(r, p.x);
+    b = math.max(b, p.y);
+  }
+  return Rect.fromLTRB(l.toDouble(), t.toDouble(), r.toDouble(), b.toDouble());
+}
+
+/// 볼록 껍질을 사각형으로 근사, 안 되면 극점 4개 (좌상·우상·우하·좌하)
+List<Offset> _quadOf(cv.VecPoint hull) {
+  final peri = cv.arcLength(hull, true);
+  for (final k in [0.02, 0.03, 0.05, 0.07, 0.1]) {
+    final approx = cv.approxPolyDP(hull, k * peri, true);
+    if (approx.length == 4) {
+      return orderCorners([for (final p in approx) Offset(p.x.toDouble(), p.y.toDouble())]);
+    }
+  }
+  final pts = [for (final p in hull) Offset(p.x.toDouble(), p.y.toDouble())];
+  Offset by(double Function(Offset) f, bool max) => pts.reduce((a, b) => (f(a) > f(b)) == max ? a : b);
+  return orderCorners([
+    by((p) => p.dx + p.dy, false),
+    by((p) => p.dx - p.dy, true),
+    by((p) => p.dx + p.dy, true),
+    by((p) => p.dx - p.dy, false),
+  ]);
 }
 
 /// 종이 영역: 종이는 배경보다 밝다 (자동 문턱값). 가장 큰 덩어리와 그 사각형.
@@ -180,29 +434,7 @@ Future<Detection> detectPage(String path) async {
   final blob = cv.Mat.zeros(blur.rows, blur.cols, cv.MatType.CV_8UC1);
   cv.drawContours(blob, contours, bestIdx, cv.Scalar.all(255), thickness: -1);
 
-  // 볼록 껍질을 사각형으로 근사, 안 되면 극점 4개
-  final hull = cv.VecPoint.fromMat(cv.convexHull(contours[bestIdx]));
-  final peri = cv.arcLength(hull, true);
-  List<Offset>? quad;
-  for (final k in [0.02, 0.03, 0.05, 0.07, 0.1]) {
-    final approx = cv.approxPolyDP(hull, k * peri, true);
-    if (approx.length == 4) {
-      quad = [for (final p in approx) Offset(p.x.toDouble(), p.y.toDouble())];
-      break;
-    }
-  }
-  if (quad == null) {
-    final pts = [for (final p in hull) Offset(p.x.toDouble(), p.y.toDouble())];
-    Offset by(double Function(Offset) f, bool max) =>
-        pts.reduce((a, b) => (f(a) > f(b)) == max ? a : b);
-    quad = [
-      by((p) => p.dx + p.dy, false),
-      by((p) => p.dx - p.dy, true),
-      by((p) => p.dx + p.dy, true),
-      by((p) => p.dx - p.dy, false),
-    ];
-  }
-  return (blob, orderCorners(quad));
+  return (blob, _quadOf(cv.VecPoint.fromMat(cv.convexHull(contours[bestIdx]))));
 }
 
 /// 종이와 비슷하게 밝은 바닥·벽이 종이에 붙지 않도록, 길게 이어진 가장자리 선으로 끊는다.
@@ -722,9 +954,10 @@ Future<Uint8List> renderPage((Uint8List, ScanMode, int, int?) args) async {
 }
 
 /// isolate에서 실행된다: 촬영 직후 자동 처리 (검출 → 펴기). 결과는 (검출, 편 이미지들).
-Future<(Detection, List<Uint8List>)> autoScan(String path) async {
-  final det = await detectPage(path);
-  return (det, await warpFlat((det.jpg, det.shape)));
+Future<List<(Detection, List<Uint8List>)>> autoScan(String path) async {
+  return [
+    for (final det in await detectPages(path)) (det, await warpFlat((det.jpg, det.shape))),
+  ];
 }
 
 Uint8List _encode(cv.Mat m) =>

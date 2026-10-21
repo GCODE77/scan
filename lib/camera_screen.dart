@@ -12,7 +12,10 @@ import 'theme.dart';
 /// 연속 촬영 화면. 셔터를 누를 때마다 뒤에서 페이지를 자동 인식·펴기 한다.
 /// '완료'를 누르면 만들어진 페이지 목록을 돌려준다.
 class CameraScreen extends StatefulWidget {
-  const CameraScreen({super.key});
+  const CameraScreen({super.key, this.galleryFirst = false});
+
+  /// 열자마자 갤러리에서 사진 고르기
+  final bool galleryFirst;
 
   @override
   State<CameraScreen> createState() => _CameraScreenState();
@@ -35,6 +38,7 @@ class _CameraScreenState extends State<CameraScreen> {
   void initState() {
     super.initState();
     _init();
+    if (widget.galleryFirst) WidgetsBinding.instance.addPostFrameCallback((_) => _pickFromGallery());
   }
 
   Future<void> _init() async {
@@ -84,9 +88,11 @@ class _CameraScreenState extends State<CameraScreen> {
     // 촬영은 바로 다음 장으로, 인식·펴기는 순서대로 뒤에서
     _queue = _queue.then((_) async {
       try {
-        final (det, flats) = await compute(autoScan, path);
-        for (var i = 0; i < flats.length; i++) {
-          _pages.add(ScanPage(det: det, shape: det.shape, part: i, flat: flats[i]));
+        // 사진 한 장에 문서가 여러 장이면 각각 페이지로
+        for (final (det, flats) in await compute(autoScan, path)) {
+          for (var i = 0; i < flats.length; i++) {
+            _pages.add(ScanPage(det: det, shape: det.shape, part: i, flat: flats[i]));
+          }
         }
       } catch (e) {
         // 한 장이 실패해도 다음 장은 계속 (예: 읽을 수 없는 형식)
@@ -160,11 +166,6 @@ class _CameraScreenState extends State<CameraScreen> {
                 onPressed: () => Navigator.pop(context),
               ),
               const Spacer(),
-              TextButton.icon(
-                onPressed: _pickFromGallery,
-                icon: const Icon(Icons.photo_library_outlined, color: Colors.white),
-                label: const Text('사진 불러오기', style: TextStyle(color: Colors.white)),
-              ),
               IconButton(
                 icon: Icon(_flashInfo[_flash]!.$1,
                     color: _flash == FlashMode.off ? Colors.white : AppColors.accent),
@@ -218,23 +219,54 @@ class _CameraScreenState extends State<CameraScreen> {
             ),
             const Padding(
               padding: EdgeInsets.only(top: 8),
-              child: Text('책을 화면에 담고 셔터만 누르세요 · 화면을 누르면 초점',
+              child: Text('셔터만 누르세요 · 여러 장도 한 번에 · 화면을 누르면 초점',
                   style: TextStyle(color: Colors.white70, fontSize: 12)),
             ),
+            // 아래 줄: [갤러리] [셔터] [찍은 페이지 = 완료]  (삼성 카메라 배치)
             Padding(
-              padding: const EdgeInsets.symmetric(vertical: 18, horizontal: 20),
+              padding: const EdgeInsets.fromLTRB(28, 16, 28, 20),
               child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // 마지막 페이지 썸네일 + 장 수
-                  SizedBox(
-                    width: 64,
-                    height: 64,
+                  _BottomSlot(
+                    label: '갤러리',
+                    onTap: _pickFromGallery,
+                    child: Container(
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: Colors.white12,
+                        border: Border.all(color: Colors.white38),
+                      ),
+                      child: const Icon(Icons.photo_library_rounded, color: Colors.white, size: 26),
+                    ),
+                  ),
+                  const Spacer(),
+                  GestureDetector(
+                    onTap: _shoot,
+                    child: Container(
+                      width: 76,
+                      height: 76,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        border: Border.all(color: Colors.white, width: 5),
+                        color: Colors.white24,
+                      ),
+                    ),
+                  ),
+                  const Spacer(),
+                  _BottomSlot(
+                    label: count + _processing == 0 ? '' : '완료',
+                    onTap: count + _processing == 0 ? null : _finish,
                     child: count == 0 && _processing == 0
-                        ? null
+                        ? const SizedBox()
                         : Stack(clipBehavior: Clip.none, children: [
                             Positioned.fill(
                               child: Container(
-                                decoration: BoxDecoration(border: Border.all(color: Colors.white, width: 2)),
+                                clipBehavior: Clip.antiAlias,
+                                decoration: BoxDecoration(
+                                  borderRadius: BorderRadius.circular(10),
+                                  border: Border.all(color: AppColors.accent, width: 2),
+                                ),
                                 child: count == 0
                                     ? null
                                     : Image.memory(_pages.last.jpg, fit: BoxFit.cover, cacheWidth: 150),
@@ -255,40 +287,40 @@ class _CameraScreenState extends State<CameraScreen> {
                                     radius: 12,
                                     backgroundColor: AppColors.accent,
                                     child: Text('$count',
-                                        style: const TextStyle(fontSize: 12, color: Color(0xFF00281F), fontWeight: FontWeight.w700))),
+                                        style: const TextStyle(
+                                            fontSize: 12, color: Color(0xFF00281F), fontWeight: FontWeight.w700))),
                               ),
                           ]),
-                  ),
-                  const Spacer(),
-                  GestureDetector(
-                    onTap: _shoot,
-                    child: Container(
-                      width: 76,
-                      height: 76,
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        border: Border.all(color: Colors.white, width: 5),
-                        color: Colors.white24,
-                      ),
-                    ),
-                  ),
-                  const Spacer(),
-                  SizedBox(
-                    width: 64,
-                    child: count + _processing == 0
-                        ? null
-                        : FilledButton(
-                            style: FilledButton.styleFrom(
-                                backgroundColor: AppColors.accent, padding: EdgeInsets.zero, minimumSize: const Size(64, 48)),
-                            onPressed: _finish,
-                            child: const Icon(Icons.check),
-                          ),
                   ),
                 ],
               ),
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// 아래 줄 양옆 버튼 (아이콘 + 이름)
+class _BottomSlot extends StatelessWidget {
+  const _BottomSlot({required this.label, required this.child, this.onTap});
+
+  final String label;
+  final Widget child;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: SizedBox(
+        width: 64,
+        child: Column(children: [
+          SizedBox(width: 56, height: 56, child: child),
+          const SizedBox(height: 6),
+          Text(label, style: const TextStyle(color: Colors.white70, fontSize: 12)),
+        ]),
       ),
     );
   }

@@ -11,12 +11,15 @@ import 'theme.dart';
 /// 문서 하나를 여는 화면: 페이지 목록, 편집, 더 스캔하기, 순서 바꾸기, 저장.
 /// 바뀔 때마다 기기에 자동 보관된다.
 class DocumentScreen extends StatefulWidget {
-  const DocumentScreen({super.key, required this.doc, this.scanFirst = false});
+  const DocumentScreen({super.key, required this.doc, this.scanFirst = false, this.galleryFirst = false});
 
   final ScanDoc doc;
 
   /// 새 문서면 바로 촬영부터
   final bool scanFirst;
+
+  /// 새 문서를 갤러리 사진으로 시작
+  final bool galleryFirst;
 
   @override
   State<DocumentScreen> createState() => _DocumentScreenState();
@@ -30,7 +33,7 @@ class _DocumentScreenState extends State<DocumentScreen> {
   void initState() {
     super.initState();
     _runOcr();
-    if (widget.scanFirst) WidgetsBinding.instance.addPostFrameCallback((_) => _scan(first: true));
+    if (widget.scanFirst) WidgetsBinding.instance.addPostFrameCallback((_) => _scan(first: true, gallery: widget.galleryFirst));
   }
 
   void _persist() => Store.save(widget.doc);
@@ -83,9 +86,10 @@ class _DocumentScreenState extends State<DocumentScreen> {
   }
 
   /// 연속 촬영(자동 인식) → 편집 화면 → 문서에 추가.
-  Future<void> _scan({bool first = false}) async {
+  Future<void> _scan({bool first = false, bool gallery = false}) async {
     final nav = Navigator.of(context);
-    final fresh = await nav.push<List<ScanPage>>(MaterialPageRoute(builder: (_) => const CameraScreen()));
+    final fresh = await nav
+        .push<List<ScanPage>>(MaterialPageRoute(builder: (_) => CameraScreen(galleryFirst: gallery)));
     if (fresh != null && fresh.isNotEmpty && mounted) {
       await nav.push(MaterialPageRoute(builder: (_) => EditorScreen(pages: fresh)));
     }
@@ -211,16 +215,6 @@ class _DocumentScreenState extends State<DocumentScreen> {
               },
             ),
           ],
-          if (_pages.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.only(right: 12, left: 4),
-              child: FilledButton.icon(
-                style: FilledButton.styleFrom(minimumSize: const Size(0, 40)),
-                onPressed: _busy ? null : _save,
-                icon: const Icon(Icons.download_rounded, size: 20),
-                label: const Text('저장', style: TextStyle(fontSize: 14)),
-              ),
-            ),
           ],
         ],
       ),
@@ -236,8 +230,8 @@ class _DocumentScreenState extends State<DocumentScreen> {
                     pending > 0
                         ? '${_pages.length}페이지 · 글자 인식 중 ($pending)'
                         : selecting
-                            ? '눌러서 선택 · 저장 버튼으로 선택한 페이지만 저장'
-                            : '${_pages.length}페이지 · 눌러서 편집, 길게 눌러 선택',
+                            ? '저장할 페이지를 눌러 고르세요'
+                            : '${_pages.length}페이지 · 눌러서 편집 · 길게 눌러 골라 저장',
                     style: const TextStyle(color: AppColors.muted, fontSize: 13),
                   ),
                 ),
@@ -268,13 +262,37 @@ class _DocumentScreenState extends State<DocumentScreen> {
             ),
           ),
       ]),
-      floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
-      floatingActionButton: selecting || _reorder
+      // 다음 행동: 저장(주) · 더 스캔(보조). 선택 중이면 선택한 페이지 저장.
+      bottomNavigationBar: _reorder || _pages.isEmpty
           ? null
-          : GradientButton(
-              icon: Icons.document_scanner_rounded,
-              label: '더 스캔하기',
-              onTap: _busy ? null : _scan,
+          : SafeArea(
+              child: Container(
+                padding: const EdgeInsets.fromLTRB(16, 10, 16, 12),
+                decoration: const BoxDecoration(
+                  color: AppColors.surface,
+                  border: Border(top: BorderSide(color: Colors.white10)),
+                ),
+                child: Row(children: [
+                  if (!selecting) ...[
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: _busy ? null : _scan,
+                        icon: const Icon(Icons.add_a_photo_outlined),
+                        label: const Text('더 스캔'),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                  ],
+                  Expanded(
+                    flex: 2,
+                    child: FilledButton.icon(
+                      onPressed: _busy ? null : _save,
+                      icon: const Icon(Icons.download_rounded),
+                      label: Text(selecting ? '선택한 ${_selected.length}장 저장' : '저장 (PDF·JPG)'),
+                    ),
+                  ),
+                ]),
+              ),
             ),
     );
   }

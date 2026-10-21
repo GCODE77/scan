@@ -163,7 +163,7 @@ class _EditorScreenState extends State<EditorScreen> {
       appBar: AppBar(
         backgroundColor: bg,
         foregroundColor: Colors.white,
-        title: const Text('편집'),
+        title: Text('편집 · ${_index + 1}/${_pages.length}'),
       ),
       body: Column(children: [
         Expanded(
@@ -194,6 +194,12 @@ class _EditorScreenState extends State<EditorScreen> {
                   ]),
                 ),
               ),
+            ),
+            // 인식된 영역: 원본 사진 위 윤곽선. 누르면 바로 수정
+            Positioned(
+              left: 12,
+              bottom: 8,
+              child: _OutlinePreview(page: _page, onTap: _busy ? null : _crop),
             ),
             if (_busy) const Center(child: CircularProgressIndicator()),
           ]),
@@ -298,10 +304,14 @@ class _EditorScreenState extends State<EditorScreen> {
               FilledButton(
                 style: FilledButton.styleFrom(
                     backgroundColor: AppColors.accent,
-                    minimumSize: const Size(64, 48),
+                    minimumSize: const Size(84, 48),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
                 onPressed: _busy ? null : () => Navigator.pop(context),
-                child: const Icon(Icons.check, size: 28),
+                child: const Row(mainAxisSize: MainAxisSize.min, children: [
+                  Icon(Icons.check_rounded, size: 22),
+                  SizedBox(width: 4),
+                  Text('완료', style: TextStyle(fontWeight: FontWeight.w800)),
+                ]),
               ),
             ]),
           ),
@@ -356,4 +366,90 @@ class _Tool extends StatelessWidget {
       ),
     );
   }
+}
+
+/// 원본 사진에 자동 인식된 윤곽(모서리·굴곡)을 그려 보여 주는 작은 창.
+class _OutlinePreview extends StatelessWidget {
+  const _OutlinePreview({required this.page, this.onTap});
+
+  final ScanPage page;
+  final VoidCallback? onTap;
+
+  /// 원본 사진은 파일에서 읽을 수도 있어서 한 번만 읽어 둔다
+  static final _cache = Expando<Uint8List>();
+
+  @override
+  Widget build(BuildContext context) {
+    final d = page.det;
+    final jpg = _cache[d] ??= d.jpg;
+    const maxW = 92.0, maxH = 120.0;
+    final s = (maxW / d.width).clamp(0.0, maxH / d.height);
+    final w = d.width * s, h = d.height * s;
+    return GestureDetector(
+      onTap: onTap,
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        Container(
+          width: w,
+          height: h,
+          clipBehavior: Clip.antiAlias,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: Colors.white38),
+            boxShadow: const [BoxShadow(color: Colors.black87, blurRadius: 10)],
+          ),
+          child: Stack(fit: StackFit.expand, children: [
+            Image.memory(jpg, fit: BoxFit.fill, cacheWidth: 240, gaplessPlayback: true),
+            CustomPaint(painter: _OutlinePainter(page.shape, s, page.shape.spread ? page.part : null)),
+          ]),
+        ),
+        const SizedBox(height: 4),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+          decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(10)),
+          child: const Row(mainAxisSize: MainAxisSize.min, children: [
+            Icon(Icons.crop_rounded, size: 12, color: AppColors.accent),
+            SizedBox(width: 4),
+            Text('윤곽 수정', style: TextStyle(color: Colors.white, fontSize: 11)),
+          ]),
+        ),
+      ]),
+    );
+  }
+}
+
+class _OutlinePainter extends CustomPainter {
+  _OutlinePainter(this.shape, this.scale, this.part);
+
+  final PageShape shape;
+  final double scale;
+
+  /// 양면이면 이 페이지 쪽만 진하게
+  final int? part;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    Offset sc(Offset p) => p * scale;
+    final t = sampleCurve(shape.top).map(sc).toList(), b = sampleCurve(shape.bottom).map(sc).toList();
+    final outline = Path()..addPolygon([...t, ...b.reversed], true);
+    canvas.drawPath(
+      Path.combine(PathOperation.difference, Path()..addRect(Offset.zero & size), outline),
+      Paint()..color = Colors.black45,
+    );
+    canvas.drawPath(
+      outline,
+      Paint()
+        ..color = AppColors.accent
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.6,
+    );
+    if (shape.spread) {
+      canvas.drawLine(sc(shape.top[kMid]), sc(shape.bottom[kMid]),
+          Paint()
+            ..color = Colors.orangeAccent
+            ..strokeWidth = 1.4);
+    }
+  }
+
+  @override
+  bool shouldRepaint(_OutlinePainter old) => old.shape != shape || old.scale != scale;
 }
