@@ -6,6 +6,7 @@ import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart
 import 'package:path_provider/path_provider.dart';
 
 import 'scanner.dart';
+import 'signature.dart';
 
 /// 인식된 한 줄: 글자와 페이지 이미지 안의 위치(픽셀).
 class OcrLine {
@@ -46,14 +47,24 @@ class ScanPage {
 
   /// 필터 강도 0~1
   double strength = 1;
+
+  /// 페이지에 얹은 서명들
+  final List<Stamp> stamps = [];
   Uint8List jpg;
   OcrResult? ocr;
 
   /// 필터·회전을 다시 입힌다. 글자 인식 결과는 위치가 바뀌므로 지운다.
   Future<void> render() async {
-    jpg = mode == ScanMode.original && quarterTurns % 4 == 0
+    var out = mode == ScanMode.original && quarterTurns % 4 == 0
         ? flat
         : await compute(renderPage, (flat, mode, quarterTurns, null, strength));
+    if (stamps.isNotEmpty) {
+      out = await compute(stampPage, (
+        out,
+        [for (final s in stamps) (s.png, s.rect.left, s.rect.top, s.rect.width, s.rect.height, s.turns)],
+      ));
+    }
+    jpg = out;
     ocr = null;
   }
 }

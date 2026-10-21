@@ -7,6 +7,7 @@ import 'package:path_provider/path_provider.dart';
 
 import 'ocr.dart';
 import 'scanner.dart';
+import 'signature.dart';
 
 /// 문서 하나 (스캔한 페이지 묶음).
 class ScanDoc {
@@ -99,6 +100,13 @@ class Store {
         ..strength = (pj['strength'] as num?)?.toDouble() ?? 1;
       final pageFile = File('${dir.path}/page_$id.jpg');
       if (await pageFile.exists()) p.jpg = await pageFile.readAsBytes();
+      for (final (i, sj) in ((pj['stamps'] as List?) ?? const []).indexed) {
+        final f = File('${dir.path}/stamp_${id}_$i.png');
+        if (!await f.exists()) continue;
+        p.stamps.add(Stamp(await f.readAsBytes(),
+            Rect.fromLTWH(sj['l'].toDouble(), sj['t'].toDouble(), sj['w'].toDouble(), sj['h'].toDouble()),
+            turns: sj['r']));
+      }
       if (pj['ocr'] != null) {
         p.ocr = OcrResult([
           for (final l in pj['ocr'] as List)
@@ -141,6 +149,11 @@ class Store {
         det.storedAt('${dir.path}/$srcName');
       }
       keep.addAll([srcName, 'flat_${p.id}.jpg', 'page_${p.id}.jpg']);
+      for (final (i, st) in p.stamps.indexed) {
+        final name = 'stamp_${p.id}_$i.png';
+        keep.add(name);
+        await File('${dir.path}/$name').writeAsBytes(st.png);
+      }
       final last = _saved[p];
       if (last == null || !identical(last.$1, p.flat)) {
         await File('${dir.path}/flat_${p.id}.jpg').writeAsBytes(p.flat);
@@ -175,6 +188,10 @@ class Store {
             'mode': p.mode.name,
             'turns': p.quarterTurns,
             'strength': p.strength,
+            'stamps': [
+              for (final st in p.stamps)
+                {'l': st.rect.left, 't': st.rect.top, 'w': st.rect.width, 'h': st.rect.height, 'r': st.turns},
+            ],
             'ocr': p.ocr == null
                 ? null
                 : [

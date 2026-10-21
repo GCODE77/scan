@@ -1276,3 +1276,39 @@ Offset? _snapBy(_Grad g, List<Offset> q, int idx, {required bool byColor}) {
   if (p == null || (p - c).distance > diag * 0.15) return null;
   return p;
 }
+
+/// isolate에서 실행된다: 페이지 위에 서명(투명 PNG)들을 얹는다.
+/// 서명마다 (PNG, 왼쪽, 위, 너비, 높이 [0~1 비율], 회전 90도 단위)
+Future<Uint8List> stampPage((Uint8List, List<(Uint8List, double, double, double, double, int)>) args) async {
+  final (jpg, stamps) = args;
+  final page = cv.imdecode(jpg, cv.IMREAD_COLOR);
+  final pw = page.cols, ph = page.rows;
+  final pd = Uint8List.fromList(page.data);
+  for (final (png, l, t, w, h, turns) in stamps) {
+    var s = cv.imdecode(png, cv.IMREAD_UNCHANGED);
+    if (s.isEmpty || s.channels != 4) continue;
+    final r = turns % 4;
+    if (r != 0) {
+      s = cv.rotate(s, const [0, cv.ROTATE_90_CLOCKWISE, cv.ROTATE_180, cv.ROTATE_90_COUNTERCLOCKWISE][r]);
+    }
+    final x0 = (l * pw).round(), y0 = (t * ph).round();
+    final sw = math.max(1, (w * pw).round()), sh = math.max(1, (h * ph).round());
+    s = cv.resize(s, (sw, sh), interpolation: cv.INTER_AREA);
+    final sd = s.data;
+    for (var y = 0; y < sh; y++) {
+      final py = y0 + y;
+      if (py < 0 || py >= ph) continue;
+      for (var x = 0; x < sw; x++) {
+        final px = x0 + x;
+        if (px < 0 || px >= pw) continue;
+        final si = (y * sw + x) * 4, a = sd[si + 3] / 255.0;
+        if (a <= 0) continue;
+        final di = (py * pw + px) * 3;
+        for (var c = 0; c < 3; c++) {
+          pd[di + c] = (pd[di + c] * (1 - a) + sd[si + c] * a).round();
+        }
+      }
+    }
+  }
+  return _encode(cv.Mat.fromList(ph, pw, cv.MatType.CV_8UC3, pd));
+}

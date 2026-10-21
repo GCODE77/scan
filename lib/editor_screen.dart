@@ -1,3 +1,5 @@
+import 'dart:ui' as ui;
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -6,6 +8,7 @@ import 'camera_screen.dart';
 import 'crop_screen.dart';
 import 'ocr.dart';
 import 'scanner.dart';
+import 'signature.dart';
 import 'theme.dart';
 
 /// 촬영 후 편집 화면: 필터 고르기, 회전, 자르기, 다시 찍기, 텍스트 추출.
@@ -60,8 +63,60 @@ class _EditorScreenState extends State<EditorScreen> {
   void _rotate(int dir) => _work(() async {
         HapticFeedback.selectionClick();
         _page.quarterTurns += dir;
+        // 얹은 서명도 페이지와 함께 돈다
+        for (final st in _page.stamps) {
+          final r = st.rect;
+          st.rect = dir > 0
+              ? Rect.fromLTWH(1 - r.bottom, r.left, r.height, r.width)
+              : Rect.fromLTWH(r.top, 1 - r.right, r.height, r.width);
+          st.turns += dir;
+        }
         await _page.render();
       });
+
+  /// 서명 넣기 (이미 있으면 추가/모두 지우기 선택)
+  Future<void> _sign() async {
+    final p = _page;
+    if (p.stamps.isNotEmpty) {
+      final act = await showModalBottomSheet<String>(
+        context: context,
+        builder: (s) => SafeArea(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            ListTile(
+                leading: const Icon(Icons.add_rounded),
+                title: const Text('서명 추가'),
+                onTap: () => Navigator.pop(s, 'add')),
+            ListTile(
+                leading: const Icon(Icons.delete_outline_rounded, color: Colors.redAccent),
+                title: Text('이 페이지 서명 모두 지우기 (${p.stamps.length}개)',
+                    style: const TextStyle(color: Colors.redAccent)),
+                onTap: () => Navigator.pop(s, 'clear')),
+          ]),
+        ),
+      );
+      if (act == null) return;
+      if (act == 'clear') {
+        await _work(() async {
+          p.stamps.clear();
+          await p.render();
+        });
+        return;
+      }
+    }
+    if (!mounted) return;
+    final png = await makeSignature(context);
+    if (png == null || !mounted) return;
+    final codec = await ui.instantiateImageCodec(p.jpg);
+    final img = (await codec.getNextFrame()).image;
+    if (!mounted) return;
+    final rect = await placeSignature(
+        context, p.jpg, Size(img.width.toDouble(), img.height.toDouble()), png);
+    if (rect == null) return;
+    await _work(() async {
+      p.stamps.add(Stamp(png, rect));
+      await p.render();
+    });
+  }
 
   /// 슬라이더를 움직이는 동안 보여 줄 값 (손을 떼면 적용)
   double? _strengthDrag;
@@ -340,12 +395,21 @@ class _EditorScreenState extends State<EditorScreen> {
           child: Padding(
             padding: const EdgeInsets.fromLTRB(4, 8, 12, 8),
             child: Row(children: [
-              _Tool(Icons.camera_alt_outlined, '다시 찍기', _busy ? null : _retake),
-              _Tool(Icons.rotate_left, '왼쪽', _busy ? null : () => _rotate(-1)),
-              _Tool(Icons.rotate_right, '오른쪽', _busy ? null : () => _rotate(1)),
-              _Tool(Icons.crop, '자르기', _busy ? null : _crop),
-              _Tool(Icons.text_fields, '텍스트 추출', _busy ? null : _extractText),
-              const SizedBox(width: 4),
+              // 도구가 많아 옆으로 밀어서 보기
+              Expanded(
+                child: SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(children: [
+                    _Tool(Icons.camera_alt_outlined, '다시 찍기', _busy ? null : _retake),
+                    _Tool(Icons.rotate_left, '왼쪽', _busy ? null : () => _rotate(-1)),
+                    _Tool(Icons.rotate_right, '오른쪽', _busy ? null : () => _rotate(1)),
+                    _Tool(Icons.crop, '자르기', _busy ? null : _crop),
+                    _Tool(Icons.text_fields, '텍스트 추출', _busy ? null : _extractText),
+                    _Tool(Icons.draw_rounded, '서명', _busy ? null : _sign),
+                  ]),
+                ),
+              ),
+              const SizedBox(width: 6),
               FilledButton(
                 style: FilledButton.styleFrom(
                     backgroundColor: AppColors.accent,
@@ -397,9 +461,11 @@ class _Tool extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Expanded(
+    return SizedBox(
+      width: 70,
       child: InkWell(
         onTap: onTap,
+        borderRadius: BorderRadius.circular(12),
         child: Padding(
           padding: const EdgeInsets.symmetric(vertical: 6),
           child: Column(mainAxisSize: MainAxisSize.min, children: [

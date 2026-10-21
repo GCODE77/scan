@@ -191,6 +191,12 @@ class _DocumentScreenState extends State<DocumentScreen> {
               ),
             )
           else ...[
+          if (!selecting && _pages.isNotEmpty)
+            IconButton(
+              tooltip: '공유하기',
+              icon: const Icon(Icons.share_rounded),
+              onPressed: _busy ? null : () => shareDocument(context, _pages, widget.doc.name),
+            ),
           if (!selecting && _pages.length > 1)
             IconButton(
               tooltip: '순서 바꾸기',

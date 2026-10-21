@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
@@ -190,6 +191,8 @@ class _CameraScreenState extends State<CameraScreen> {
                                   e.localPosition.dy / box.maxHeight)),
                               child: Stack(fit: StackFit.expand, children: [
                               CameraPreview(c),
+                              // 문서를 맞추는 네모 점선 안내
+                              const IgnorePointer(child: CustomPaint(painter: _GuidePainter())),
                               if (_focusAt != null)
                                 Positioned(
                                   left: _focusAt!.dx * box.maxWidth - 36,
@@ -339,4 +342,53 @@ class _BottomSlot extends StatelessWidget {
       ),
     );
   }
+}
+
+/// 촬영 안내: 네모 점선 + 모서리 꺾쇠
+class _GuidePainter extends CustomPainter {
+  const _GuidePainter();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final r = Rect.fromLTRB(size.width * .07, size.height * .06, size.width * .93, size.height * .94);
+    final dash = Paint()
+      ..color = Colors.white.withValues(alpha: .7)
+      ..strokeWidth = 1.6
+      ..style = PaintingStyle.stroke;
+    // 점선 테두리
+    void dashed(Offset a, Offset b) {
+      final d = b - a, len = d.distance, u = d / len;
+      for (var t = 0.0; t < len; t += 14) {
+        canvas.drawLine(a + u * t, a + u * math.min(t + 8, len), dash);
+      }
+    }
+
+    dashed(r.topLeft, r.topRight);
+    dashed(r.topRight, r.bottomRight);
+    dashed(r.bottomRight, r.bottomLeft);
+    dashed(r.bottomLeft, r.topLeft);
+    // 모서리 꺾쇠 (민트)
+    final corner = Paint()
+      ..color = const Color(0xFF4FE3C1)
+      ..strokeWidth = 4
+      ..strokeCap = StrokeCap.round
+      ..style = PaintingStyle.stroke;
+    const l = 28.0;
+    for (final (p, dx, dy) in [
+      (r.topLeft, 1.0, 1.0),
+      (r.topRight, -1.0, 1.0),
+      (r.bottomRight, -1.0, -1.0),
+      (r.bottomLeft, 1.0, -1.0),
+    ]) {
+      canvas.drawPath(
+          Path()
+            ..moveTo(p.dx, p.dy + dy * l)
+            ..lineTo(p.dx, p.dy)
+            ..lineTo(p.dx + dx * l, p.dy),
+          corner);
+    }
+  }
+
+  @override
+  bool shouldRepaint(_GuidePainter old) => false;
 }

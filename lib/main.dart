@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 
 import 'document_screen.dart';
+import 'save_sheet.dart';
 import 'storage.dart';
 import 'theme.dart';
 import 'updater.dart';
@@ -78,6 +79,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
           ),
           const Divider(height: 1),
           ListTile(
+              leading: const Icon(Icons.share_rounded),
+              title: const Text('공유하기'),
+              subtitle: const Text('카카오톡·메일 등', style: TextStyle(color: AppColors.muted)),
+              onTap: () => Navigator.pop(s, 'share')),
+          ListTile(
               leading: const Icon(Icons.edit_outlined),
               title: const Text('이름 바꾸기'),
               onTap: () => Navigator.pop(s, 'rename')),
@@ -89,6 +95,12 @@ class _LibraryScreenState extends State<LibraryScreen> {
       ),
     );
     if (!mounted) return;
+    if (action == 'share') {
+      await Store.load(doc);
+      if (mounted) await shareDocument(context, doc.pages, doc.name);
+      doc.pages = [];
+      return;
+    }
     if (action == 'rename') {
       final ctl = TextEditingController(text: doc.name);
       final name = await showDialog<String>(

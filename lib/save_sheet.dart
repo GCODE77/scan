@@ -323,3 +323,50 @@ Future<Uint8List> _buildPdf(List<ScanPage> pages, SaveOptions o, int? maxSide, i
   }
   return doc.save();
 }
+
+/// 공유하기: 형식만 고르면 바로 안드로이드 공유 창(카카오톡·메일 등)이 열린다.
+Future<void> shareDocument(BuildContext context, List<ScanPage> pages, String docName) async {
+  final format = await showModalBottomSheet<SaveFormat>(
+    context: context,
+    backgroundColor: AppColors.surface,
+    shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(24))),
+    builder: (s) => SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 18, 20, 12),
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('공유하기', style: Theme.of(s).textTheme.titleLarge),
+          const SizedBox(height: 4),
+          Text('${pages.length}페이지 · 다음 화면에서 카카오톡·메일 등 보낼 앱을 고르세요',
+              style: const TextStyle(color: AppColors.muted)),
+          const SizedBox(height: 16),
+          for (final (f, icon, title, sub) in [
+            (SaveFormat.pdf, Icons.picture_as_pdf_rounded, 'PDF 한 개로', '글자 검색 가능'),
+            (SaveFormat.jpg, Icons.image_rounded, '사진(JPG)으로', '페이지마다 한 장'),
+            (SaveFormat.txt, Icons.notes_rounded, '글자(TXT)로', '인식된 글자만'),
+          ])
+            Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: Material(
+                color: AppColors.card,
+                borderRadius: BorderRadius.circular(16),
+                child: ListTile(
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                  leading: Icon(icon, color: AppColors.accent),
+                  title: Text(title, style: const TextStyle(fontWeight: FontWeight.w700)),
+                  subtitle: Text(sub, style: const TextStyle(color: AppColors.muted)),
+                  trailing: const Icon(Icons.ios_share_rounded),
+                  onTap: () => Navigator.pop(s, f),
+                ),
+              ),
+            ),
+        ]),
+      ),
+    ),
+  );
+  if (format == null) return;
+  final o = SaveOptions()
+    ..name = docName.replaceAll(RegExp(r'[\/:*?"<>|]'), '-').replaceAll(' ', '_')
+    ..format = format
+    ..quality = SaveQuality.standard;
+  await runSave(pages, o, SaveTarget.share);
+}
