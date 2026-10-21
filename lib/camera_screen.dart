@@ -20,8 +20,12 @@ class CameraScreen extends StatefulWidget {
 class _CameraScreenState extends State<CameraScreen> {
   CameraController? _controller;
   String? _error;
-  bool _flash = false;
+  FlashMode _flash = FlashMode.off;
   bool _flashEffect = false;
+
+  /// 화면을 누른 곳 (초점 표시용, 0~1 비율)
+  Offset? _focusAt;
+  int _focusSeq = 0;
   final List<ScanPage> _pages = [];
   int _processing = 0;
   Future<void> _queue = Future.value();
@@ -85,10 +89,43 @@ class _CameraScreenState extends State<CameraScreen> {
     if (mounted) Navigator.pop(context, _pages);
   }
 
-  Future<void> _toggleFlash() async {
-    _flash = !_flash;
-    await _controller?.setFlashMode(_flash ? FlashMode.torch : FlashMode.off);
-    setState(() {});
+  static const _flashModes = [FlashMode.off, FlashMode.auto, FlashMode.always, FlashMode.torch];
+  static const _flashInfo = {
+    FlashMode.off: (Icons.flash_off_rounded, '플래시 끔'),
+    FlashMode.auto: (Icons.flash_auto_rounded, '플래시 자동'),
+    FlashMode.always: (Icons.flash_on_rounded, '플래시 켬'),
+    FlashMode.torch: (Icons.highlight_rounded, '조명 계속 켬'),
+  };
+
+  Future<void> _cycleFlash() async {
+    final next = _flashModes[(_flashModes.indexOf(_flash) + 1) % _flashModes.length];
+    try {
+      await _controller?.setFlashMode(next);
+      setState(() => _flash = next);
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(SnackBar(
+              content: Text(_flashInfo[next]!.$2), duration: const Duration(milliseconds: 900)));
+      }
+    } catch (_) {}
+  }
+
+  /// 누른 곳에 초점·밝기 맞추기
+  Future<void> _focus(Offset rel) async {
+    final c = _controller;
+    if (c == null) return;
+    final seq = ++_focusSeq;
+    setState(() => _focusAt = rel);
+    try {
+      await c.setFocusMode(FocusMode.auto);
+      await c.setFocusPoint(rel);
+      await c.setExposurePoint(rel);
+    } catch (_) {
+      // 초점 지정이 안 되는 카메라도 있다
+    }
+    await Future.delayed(const Duration(milliseconds: 1200));
+    if (mounted && seq == _focusSeq) setState(() => _focusAt = null);
   }
 
   @override
@@ -107,8 +144,10 @@ class _CameraScreenState extends State<CameraScreen> {
               ),
               const Spacer(),
               IconButton(
-                icon: Icon(_flash ? Icons.flash_on : Icons.flash_off, color: Colors.white),
-                onPressed: _toggleFlash,
+                icon: Icon(_flashInfo[_flash]!.$1,
+                    color: _flash == FlashMode.off ? Colors.white : AppColors.accent),
+                tooltip: _flashInfo[_flash]!.$2,
+                onPressed: _cycleFlash,
               ),
             ]),
             Expanded(
@@ -119,20 +158,45 @@ class _CameraScreenState extends State<CameraScreen> {
                         ? const CircularProgressIndicator()
                         : AspectRatio(
                             aspectRatio: 1 / c.value.aspectRatio,
-                            child: Stack(fit: StackFit.expand, children: [
+                            child: LayoutBuilder(builder: (context, box) => GestureDetector(
+                              onTapUp: (e) => _focus(Offset(e.localPosition.dx / box.maxWidth,
+                                  e.localPosition.dy / box.maxHeight)),
+                              child: Stack(fit: StackFit.expand, children: [
                               CameraPreview(c),
+                              if (_focusAt != null)
+                                Positioned(
+                                  left: _focusAt!.dx * box.maxWidth - 36,
+                                  top: _focusAt!.dy * box.maxHeight - 36,
+                                  child: TweenAnimationBuilder<double>(
+                                    key: ValueKey(_focusSeq),
+                                    tween: Tween(begin: 1.5, end: 1),
+                                    duration: const Duration(milliseconds: 250),
+                                    builder: (_, v, _) => Transform.scale(
+                                      scale: v,
+                                      child: Container(
+                                        width: 72,
+                                        height: 72,
+                                        decoration: BoxDecoration(
+                                          shape: BoxShape.circle,
+                                          border: Border.all(color: AppColors.accent, width: 2),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
                               AnimatedOpacity(
                                 opacity: _flashEffect ? 0.7 : 0,
                                 duration: const Duration(milliseconds: 100),
                                 child: const ColoredBox(color: Colors.white),
                               ),
                             ]),
+                            )),
                           ),
               ),
             ),
             const Padding(
               padding: EdgeInsets.only(top: 8),
-              child: Text('책을 화면에 담고 셔터만 누르세요 · 자동으로 인식합니다',
+              child: Text('책을 화면에 담고 셔터만 누르세요 · 화면을 누르면 초점',
                   style: TextStyle(color: Colors.white70, fontSize: 12)),
             ),
             Padding(

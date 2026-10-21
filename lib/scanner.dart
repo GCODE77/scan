@@ -76,68 +76,104 @@ Future<Detection> detectPage(String path) async {
   final w = img.cols, h = img.rows;
   final (_, jpg) = cv.imencode('.jpg', img, params: cv.VecI32.fromList([cv.IMWRITE_JPEG_QUALITY, 95]));
 
-  // 작게 줄여서 윤곽 찾기 (속도와 잡음 감소)
+  // 작게 줄여서 분석 (속도와 잡음 감소)
   final scale = 800 / math.max(w, h);
-  final small = cv.resize(img, ((w * scale).round(), (h * scale).round()));
-  final gray = cv.cvtColor(small, cv.COLOR_BGR2GRAY);
-  final quad = _findQuad(gray);
+  final small = cv.resize(img, ((w * scale).round(), (h * scale).round()), interpolation: cv.INTER_AREA);
+  final blur = cv.gaussianBlur(cv.cvtColor(small, cv.COLOR_BGR2GRAY), (7, 7), 0);
+  final paper = _paperMask(blur);
 
-  if (quad == null) {
+  Detection fallback() {
     // 못 찾으면 사진 전체를 페이지로 (사용자가 원하면 나중에 자르기로 조정)
     final c = [Offset.zero, Offset(w - 1.0, 0), Offset(w - 1.0, h - 1.0), Offset(0, h - 1.0)];
     return Detection(jpg, w, h, PageShape.quad(c, false), false);
   }
 
-  final img2 = _Gray(gray);
-  final widthPx = ((quad[1] - quad[0]).distance + (quad[2] - quad[3]).distance) / 2;
-  final heightPx = ((quad[3] - quad[0]).distance + (quad[2] - quad[1]).distance) / 2;
-  final spread = widthPx > heightPx * 1.15; // 가로로 넓으면 펼친 양면으로 본다
+  if (paper == null) return fallback();
+  final (blob, quad0) = paper;
+  final g = _Gray(blur), m = _Gray(blob);
+  var [tl, tr, br, bl] = quad0;
 
-  // 제본선 위치 (양면일 때만): 가운데 부근에서 가장 어두운 세로줄
-  var spineS = 0.5;
-  if (spread) spineS = _findSpine(img2, quad);
+  // 제본선 (펼친 책의 가운데 골짜기)
+  final spine = _findSpine(g, tl, tr, br, bl);
+  var spread = false;
+  if (spine != null) {
+    final (st, sb) = spine;
+    final wl = ((st - tl).distance + (sb - bl).distance) / 2;
+    final wr = ((tr - st).distance + (br - sb).distance) / 2;
+    if (wl < wr * 0.6) {
+      // 왼쪽은 사진 밖으로 잘린 조각 → 오른쪽 페이지만
+      tl = st;
+      bl = sb;
+    } else if (wr < wl * 0.6) {
+      tr = st;
+      br = sb;
+    } else {
+      spread = true;
+    }
+  }
 
-  // 가장자리를 따라갈 지점들 (양면이면 가운데 점이 제본선에 오도록)
-  final ss = spread
+  // 위·아래 가장자리를 따라갈 기준점 (양면이면 가운데 점이 제본선 위에 오도록)
+  List<Offset> bases(Offset a, Offset mid, Offset b) => spread
       ? [
-          for (var i = 0; i <= kMid; i++) spineS * i / kMid,
-          for (var i = 1; i <= kMid; i++) spineS + (1 - spineS) * i / kMid,
+          for (var i = 0; i <= kMid; i++) Offset.lerp(a, mid, i / kMid)!,
+          for (var i = 1; i <= kMid; i++) Offset.lerp(mid, b, i / kMid)!,
         ]
-      : [for (var i = 0; i < kPts; i++) i / (kPts - 1)];
-  final center = quad.reduce((a, b) => a + b) / 4;
-  final top = _traceEdge(img2, quad[0], quad[1], ss, center, heightPx);
-  final bottom = _traceEdge(img2, quad[3], quad[2], ss, center, heightPx);
-  Offset up(Offset p) => p / scale;
+      : [for (var i = 0; i < kPts; i++) Offset.lerp(a, b, i / (kPts - 1))!];
+
+  final center = (tl + tr + br + bl) / 4;
+  final pageH = ((bl - tl).distance + (br - tr).distance) / 2;
+  final top = _traceEdge(m, bases(tl, spine?.$1 ?? tl, tr), center, pageH);
+  final bottom = _traceEdge(m, bases(bl, spine?.$2 ?? bl, br), center, pageH);
+  Offset up(Offset p) => Offset((p.dx / scale).clamp(0, w - 1.0), (p.dy / scale).clamp(0, h - 1.0));
   return Detection(jpg, w, h, PageShape(top.map(up).toList(), bottom.map(up).toList(), spread), true);
 }
 
-/// 가장 큰 사각형 윤곽(작은 이미지 좌표, 좌상·우상·우하·좌하 순).
-List<Offset>? _findQuad(cv.Mat gray) {
-  final blur = cv.gaussianBlur(gray, (5, 5), 0);
-  final edges = cv.canny(blur, 50, 150);
-  final kernel = cv.getStructuringElement(cv.MORPH_RECT, (5, 5));
-  final closed = cv.dilate(edges, kernel, iterations: 2);
-  final (contours, _) = cv.findContours(closed, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+/// 종이 영역: 종이는 배경보다 밝다 (자동 문턱값). 가장 큰 덩어리와 그 사각형.
+(cv.Mat, List<Offset>)? _paperMask(cv.Mat blur) {
+  final (_, bin) = cv.threshold(blur, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+  // 글자·그림 구멍을 메우고 잔티를 지운다
+  var mask = cv.morphologyEx(bin, cv.MORPH_CLOSE, cv.getStructuringElement(cv.MORPH_RECT, (15, 15)),
+      iterations: 2);
+  mask = cv.morphologyEx(mask, cv.MORPH_OPEN, cv.getStructuringElement(cv.MORPH_RECT, (9, 9)));
+  final (contours, _) = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
-  final minArea = gray.cols * gray.rows * 0.15;
-  List<Offset>? best;
-  double bestArea = 0;
-  for (final c in contours) {
-    final area = cv.contourArea(c);
-    if (area < minArea || area <= bestArea) continue;
-    // 책은 가장자리가 휘어 있어 꼭짓점이 많다 → 볼록 껍질을 크게 근사해서 4점을 찾는다
-    final hull = cv.VecPoint.fromMat(cv.convexHull(c));
-    final peri = cv.arcLength(hull, true);
-    for (final k in [0.02, 0.03, 0.05, 0.07, 0.1]) {
-      final approx = cv.approxPolyDP(hull, k * peri, true);
-      if (approx.length == 4) {
-        best = [for (final p in approx) Offset(p.x.toDouble(), p.y.toDouble())];
-        bestArea = area;
-        break;
-      }
+  var bestIdx = -1;
+  var bestArea = blur.cols * blur.rows * 0.12; // 너무 작으면 종이가 아니다
+  for (var i = 0; i < contours.length; i++) {
+    final a = cv.contourArea(contours[i]);
+    if (a > bestArea) {
+      bestArea = a;
+      bestIdx = i;
     }
   }
-  return best == null ? null : orderCorners(best);
+  if (bestIdx < 0) return null;
+
+  final blob = cv.Mat.zeros(blur.rows, blur.cols, cv.MatType.CV_8UC1);
+  cv.drawContours(blob, contours, bestIdx, cv.Scalar.all(255), thickness: -1);
+
+  // 볼록 껍질을 사각형으로 근사, 안 되면 극점 4개
+  final hull = cv.VecPoint.fromMat(cv.convexHull(contours[bestIdx]));
+  final peri = cv.arcLength(hull, true);
+  List<Offset>? quad;
+  for (final k in [0.02, 0.03, 0.05, 0.07, 0.1]) {
+    final approx = cv.approxPolyDP(hull, k * peri, true);
+    if (approx.length == 4) {
+      quad = [for (final p in approx) Offset(p.x.toDouble(), p.y.toDouble())];
+      break;
+    }
+  }
+  if (quad == null) {
+    final pts = [for (final p in hull) Offset(p.x.toDouble(), p.y.toDouble())];
+    Offset by(double Function(Offset) f, bool max) =>
+        pts.reduce((a, b) => (f(a) > f(b)) == max ? a : b);
+    quad = [
+      by((p) => p.dx + p.dy, false),
+      by((p) => p.dx - p.dy, true),
+      by((p) => p.dx + p.dy, true),
+      by((p) => p.dx - p.dy, false),
+    ];
+  }
+  return (blob, orderCorners(quad));
 }
 
 /// 네 점을 좌상, 우상, 우하, 좌하 순으로 정렬.
@@ -163,66 +199,90 @@ class _Gray {
   final int w, h;
   final Uint8List data;
 
-  double at(Offset p) {
-    final x = p.dx.round().clamp(0, w - 1), y = p.dy.round().clamp(0, h - 1);
-    return data[y * w + x].toDouble();
+  double at(double x, double y) {
+    final xi = x.round().clamp(0, w - 1), yi = y.round().clamp(0, h - 1);
+    return data[yi * w + xi].toDouble();
+  }
+
+  /// 마스크용: 사진 밖은 종이가 아니다
+  bool on(Offset p) {
+    final x = p.dx.round(), y = p.dy.round();
+    return x >= 0 && y >= 0 && x < w && y < h && data[y * w + x] > 0;
   }
 }
 
-/// 직선 a→b를 따라 여러 지점에서 실제 종이 가장자리(어두움→밝음 경계)를 찾아 곡선을 만든다.
-/// 이웃과 동떨어진 값(그림자·글자에 잘못 걸린 경우)은 이웃 평균으로 바로잡는다.
-List<Offset> _traceEdge(_Gray g, Offset a, Offset b, List<double> ss, Offset center, double pageH) {
-  final d = b - a;
-  var n = Offset(-d.dy, d.dx) / d.distance;
-  final mid = Offset.lerp(a, b, 0.5)!;
-  if ((center - mid).dx * n.dx + (center - mid).dy * n.dy < 0) n = -n; // 페이지 안쪽 방향
+/// 가장자리 곡선 추적: 기준점마다 바깥에서 안쪽으로 걸어가며 처음 종이를 만나는 곳.
+/// 이웃과 동떨어진 값(잡음)은 이웃 평균으로 바로잡는다.
+List<Offset> _traceEdge(_Gray mask, List<Offset> bases, Offset center, double pageH) {
+  final n = bases.length;
+  final normals = <Offset>[];
+  for (var i = 0; i < n; i++) {
+    final d = bases[math.min(i + 1, n - 1)] - bases[math.max(i - 1, 0)];
+    var nv = Offset(-d.dy, d.dx) / d.distance;
+    final toC = center - bases[i];
+    if (toC.dx * nv.dx + toC.dy * nv.dy < 0) nv = -nv; // 페이지 안쪽 방향
+    normals.add(nv);
+  }
 
-  final off = [for (final s in ss) (s == 0 || s == 1) ? 0.0 : _snapOffset(g, a, b, s, n, pageH)];
-  final limit = pageH * 0.03;
-  for (var i = 1; i < off.length - 1; i++) {
+  final from = -(pageH * 0.1).round(), to = (pageH * 0.18).round();
+  final off = <double>[];
+  for (var i = 0; i < n; i++) {
+    double? found;
+    for (var t = from; t <= to && found == null; t++) {
+      final q = bases[i] + normals[i] * t.toDouble();
+      // 5픽셀 연속 종이여야 진짜 가장자리 (잡음 제외)
+      if (mask.on(q) && [for (var k = 1; k <= 5; k++) mask.on(q + normals[i] * k.toDouble())].every((v) => v)) {
+        found = t.toDouble();
+      }
+    }
+    off.add(found ?? 0);
+  }
+
+  final limit = pageH * 0.04;
+  for (var i = 1; i < n - 1; i++) {
     final expect = (off[i - 1] + off[i + 1]) / 2;
     if ((off[i] - expect).abs() > limit) off[i] = expect;
   }
-  return [for (var i = 0; i < ss.length; i++) Offset.lerp(a, b, ss[i])! + n * off[i]];
+  return [for (var i = 0; i < n; i++) bases[i] + normals[i] * off[i]];
 }
 
-/// s 지점에서 수직 방향으로 가장자리까지의 거리 (주변 5곳의 중앙값).
-double _snapOffset(_Gray g, Offset a, Offset b, double s, Offset n, double pageH) {
-  final band = pageH * 0.12;
-  final offsets = <double>[];
-  for (var j = -2; j <= 2; j++) {
-    final p0 = Offset.lerp(a, b, (s + j * 0.008).clamp(0.0, 1.0))!;
-    double bestT = 0, bestG = 18; // 이보다 약한 경계는 무시
-    for (var t = -band; t <= band; t += 1) {
-      final grad = g.at(p0 + n * (t + 3)) - g.at(p0 + n * (t - 3));
-      if (grad > bestG) {
-        bestG = grad;
-        bestT = t;
+/// 제본선(펼친 책 가운데 골짜기)을 찾는다. 기울어진 직선(위 점, 아래 점)으로.
+/// 선 위 점이 양옆보다 어두운 정도의 '중앙값'을 본다 → 끊김 없이 이어진 골짜기만 높게 나오고
+/// 띄엄띄엄 있는 글자·음표는 걸러진다. 없으면 null.
+(Offset, Offset)? _findSpine(_Gray g, Offset tl, Offset tr, Offset br, Offset bl) {
+  double valley(Offset a, Offset b) {
+    var best = 0.0;
+    for (final d in const [5, 12]) {
+      final v = <double>[];
+      for (var k = 0; k < 40; k++) {
+        final p = Offset.lerp(a, b, 0.1 + 0.8 * k / 39)!;
+        if (p.dx < d || p.dx >= g.w - d || p.dy < 0 || p.dy >= g.h) continue;
+        v.add(math.min(g.at(p.dx - d, p.dy), g.at(p.dx + d, p.dy)) - g.at(p.dx, p.dy));
+      }
+      if (v.length > 20) {
+        v.sort();
+        best = math.max(best, v[v.length ~/ 2]);
       }
     }
-    offsets.add(bestT);
+    return best;
   }
-  offsets.sort();
-  return offsets[2];
-}
 
-/// 양면 사진에서 제본선(가운데 그림자)의 위치를 0~1 비율로 찾는다.
-double _findSpine(_Gray g, List<Offset> q) {
-  var bestS = 0.5, bestV = double.infinity;
-  for (var s = 0.35; s <= 0.65; s += 0.005) {
-    final t = Offset.lerp(q[0], q[1], s)!, b = Offset.lerp(q[3], q[2], s)!;
-    var sum = 0.0;
-    for (var k = 1; k < 30; k++) {
-      sum += g.at(Offset.lerp(t, b, k / 30)!);
-    }
-    // 가운데에 가까울수록 약간 우대 (그림 때문에 엉뚱한 곳이 잡히는 것 방지)
-    final v = sum / 29 + (s - 0.5).abs() * 40;
-    if (v < bestV) {
-      bestV = v;
-      bestS = s;
+  (Offset, Offset)? best;
+  var bestScore = 6.0; // 이보다 약하면 제본선 없음 (한 쪽 페이지)
+  for (var i = 0; i <= 120; i++) {
+    final s = 0.08 + 0.84 * i / 120;
+    final a = Offset.lerp(tl, tr, s)!;
+    final b0 = Offset.lerp(bl, br, s)!;
+    for (var db = -60; db <= 60; db += 4) {
+      final b = b0 + Offset(db.toDouble(), 0);
+      final v = valley(a, b);
+      if (v > bestScore) {
+        bestScore = v;
+        best = (a, b);
+      }
     }
   }
-  return bestS;
+  return best;
 }
 
 // ───────────────────────── 펴기 ─────────────────────────

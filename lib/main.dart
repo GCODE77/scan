@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'document_screen.dart';
 import 'storage.dart';
 import 'theme.dart';
+import 'updater.dart';
 
 void main() => runApp(const BookScanApp());
 
@@ -39,6 +40,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
   void initState() {
     super.initState();
     _refresh();
+    // 새 버전이 GitHub에 올라와 있으면 알려 준다
+    WidgetsBinding.instance.addPostFrameCallback((_) => Updater.checkAndPrompt(context));
   }
 
   Future<void> _refresh() async {

@@ -10,6 +10,8 @@ android {
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
+        // ota_update(앱 내 업데이트)에 필요
+        isCoreLibraryDesugaringEnabled = true
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
@@ -52,4 +54,5 @@ flutter {
 dependencies {
     // 한국어 OCR 모델 (영어 등 라틴 문자도 함께 인식)
     implementation("com.google.mlkit:text-recognition-korean:16.0.1")
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
 }
