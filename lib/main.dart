@@ -159,6 +159,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 _query = '';
               }),
             ),
+          IconButton(
+            tooltip: '앱 정보',
+            icon: const Icon(Icons.info_outline_rounded),
+            onPressed: () => Updater.showAbout(context),
+          ),
         ],
       ),
       body: docs == null
@@ -297,6 +302,8 @@ class _Empty extends StatelessWidget {
             textAlign: TextAlign.center,
             style: TextStyle(color: AppColors.muted, height: 1.6),
           ),
+          const SizedBox(height: 40),
+          const Text(kCopyright, style: TextStyle(color: Colors.white24, fontSize: 11)),
         ]),
       ),
     );
