@@ -72,8 +72,12 @@ const scanModeLabels = {
 
 /// isolate에서 실행된다: 사진 경로 → 페이지 윤곽(모서리 + 굴곡) 검출.
 Future<Detection> detectPage(String path) async {
-  final img = cv.imread(path, flags: cv.IMREAD_COLOR);
+  var img = cv.imread(path, flags: cv.IMREAD_COLOR);
   if (img.isEmpty) throw Exception('읽을 수 없는 사진 형식입니다');
+  // 글자가 세로로 누워 있으면(문서를 옆으로 찍음) 90도 돌려서 바로 세운다
+  if (_orientScore(cv.rotate(img, cv.ROTATE_90_CLOCKWISE)) > _orientScore(img) * 1.3) {
+    img = cv.rotate(img, cv.ROTATE_90_CLOCKWISE);
+  }
   final w = img.cols, h = img.rows;
   final (_, jpg) = cv.imencode('.jpg', img, params: cv.VecI32.fromList([cv.IMWRITE_JPEG_QUALITY, 95]));
 
@@ -100,7 +104,9 @@ Future<Detection> detectPage(String path) async {
   var [tl, tr, br, bl] = quad0;
 
   // 1) 제본선: 어두운 골짜기 → 없으면 글자 덩어리 사이 여백
-  final spine = _findSpine(g, ink, tl, tr, br, bl) ?? _inkGapSpine(ink, tl, tr, br, bl);
+  final shadowSpine = _findSpine(g, ink, tl, tr, br, bl);
+  final byShadow = shadowSpine != null;
+  final spine = shadowSpine ?? _inkGapSpine(ink, tl, tr, br, bl);
 
   // 2) 사진 밖으로 잘린 옆 페이지는 버린다. 양쪽이 비슷하면 양면.
   var spread = false;
@@ -114,7 +120,8 @@ Future<Detection> detectPage(String path) async {
     } else if (wr < wl * 0.6) {
       tr = st;
       br = sb;
-    } else {
+    } else if (byShadow) {
+      // 양면은 제본선 그림자가 보일 때만 (2단 문서의 단 사이 여백은 양면이 아니다)
       spread = true;
     }
   }
@@ -156,6 +163,7 @@ Future<Detection> detectPage(String path) async {
   var mask = cv.morphologyEx(bin, cv.MORPH_CLOSE, cv.getStructuringElement(cv.MORPH_RECT, (15, 15)),
       iterations: 2);
   mask = cv.morphologyEx(mask, cv.MORPH_OPEN, cv.getStructuringElement(cv.MORPH_RECT, (9, 9)));
+  mask = _cutByLongEdges(blur, mask);
   final (contours, _) = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
   var bestIdx = -1;
@@ -195,6 +203,44 @@ Future<Detection> detectPage(String path) async {
     ];
   }
   return (blob, orderCorners(quad));
+}
+
+/// 종이와 비슷하게 밝은 바닥·벽이 종이에 붙지 않도록, 길게 이어진 가장자리 선으로 끊는다.
+/// (짧은 선 = 글자 테두리는 끊지 않음)
+cv.Mat _cutByLongEdges(cv.Mat blur, cv.Mat mask) {
+  final edges = cv.dilate(cv.canny(blur, 30, 90), cv.getStructuringElement(cv.MORPH_RECT, (3, 3)));
+  final labels = cv.Mat.empty(), stats = cv.Mat.empty(), cents = cv.Mat.empty();
+  final n = cv.connectedComponentsWithStats(edges, labels, stats, cents, 8, cv.MatType.CV_32S, -1);
+  final minLen = math.max(blur.cols, blur.rows) * 0.15;
+  final long = List<bool>.filled(n, false);
+  for (var i = 1; i < n; i++) {
+    long[i] = math.max(stats.at<int>(i, 2), stats.at<int>(i, 3)) > minLen;
+  }
+  final lab = Uint8List.fromList(labels.data).buffer.asInt32List();
+  final out = Uint8List.fromList(mask.data);
+  for (var i = 0; i < out.length; i++) {
+    if (long[lab[i]]) out[i] = 0;
+  }
+  final cut = cv.Mat.fromList(mask.rows, mask.cols, cv.MatType.CV_8UC1, out);
+  return cv.morphologyEx(cut, cv.MORPH_OPEN, cv.getStructuringElement(cv.MORPH_RECT, (5, 5)));
+}
+
+/// 글자 줄이 가로로 놓인 정도 (가로로 길쭉한 잉크 덩어리 길이의 합).
+double _orientScore(cv.Mat img) {
+  final s = 600 / math.max(img.cols, img.rows);
+  final sm = cv.resize(img, ((img.cols * s).round(), (img.rows * s).round()), interpolation: cv.INTER_AREA);
+  final ink = cv.adaptiveThreshold(cv.cvtColor(sm, cv.COLOR_BGR2GRAY), 255, cv.ADAPTIVE_THRESH_MEAN_C,
+      cv.THRESH_BINARY_INV, 25, 15);
+  final k = math.max(9, sm.cols ~/ 30);
+  final lm = cv.morphologyEx(ink, cv.MORPH_CLOSE, cv.getStructuringElement(cv.MORPH_RECT, (k, 1)));
+  final labels = cv.Mat.empty(), stats = cv.Mat.empty(), cents = cv.Mat.empty();
+  final n = cv.connectedComponentsWithStats(lm, labels, stats, cents, 8, cv.MatType.CV_32S, -1);
+  var sum = 0.0;
+  for (var i = 1; i < n; i++) {
+    final bw = stats.at<int>(i, 2), bh = stats.at<int>(i, 3);
+    if (bw > 4 * bh && bw > k * 2) sum += bw;
+  }
+  return sum;
 }
 
 /// 네 점을 좌상, 우상, 우하, 좌하 순으로 정렬.
