@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'document_screen.dart';
 import 'save_sheet.dart';
@@ -36,6 +37,49 @@ class _LibraryScreenState extends State<LibraryScreen> {
   List<ScanDoc>? _docs;
   String _query = '';
   bool _searching = false;
+
+  /// 선택 모드 (여러 문서 골라서 삭제)
+  bool _selectMode = false;
+  final Set<String> _selected = {};
+
+  void _toggle(ScanDoc d) => setState(() {
+        if (!_selected.remove(d.id)) _selected.add(d.id);
+      });
+
+  void _exitSelect() => setState(() {
+        _selectMode = false;
+        _selected.clear();
+      });
+
+  Future<void> _deleteSelected() async {
+    final targets = _docs!.where((d) => _selected.contains(d.id)).toList();
+    if (targets.isEmpty) return;
+    final pages = targets.fold<int>(0, (s, d) => s + d.pageCount);
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (d) => AlertDialog(
+        title: Text('문서 ${targets.length}개를 삭제할까요?'),
+        content: Text('모두 $pages페이지입니다. 삭제하면 되돌릴 수 없습니다.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('취소')),
+          FilledButton(
+              style: FilledButton.styleFrom(backgroundColor: Colors.redAccent),
+              onPressed: () => Navigator.pop(d, true),
+              child: const Text('삭제')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    for (final d in targets) {
+      await Store.delete(d);
+    }
+    _exitSelect();
+    _refresh();
+    if (mounted) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('문서 ${targets.length}개를 삭제했습니다')));
+    }
+  }
 
   @override
   void initState() {
@@ -147,7 +191,27 @@ class _LibraryScreenState extends State<LibraryScreen> {
         ?.where((d) => _query.isEmpty || d.name.toLowerCase().contains(_query.toLowerCase()))
         .toList();
     return Scaffold(
-      appBar: AppBar(
+      appBar: _selectMode
+          ? AppBar(
+              leading: IconButton(icon: const Icon(Icons.close), onPressed: _exitSelect),
+              title: Text('${_selected.length}개 선택'),
+              actions: [
+                TextButton.icon(
+                  icon: Icon(_selected.length == (docs?.length ?? 0)
+                      ? Icons.deselect_rounded
+                      : Icons.select_all_rounded),
+                  label: Text(_selected.length == (docs?.length ?? 0) ? '선택 해제' : '전체 선택'),
+                  onPressed: () => setState(() {
+                    if (_selected.length == (docs?.length ?? 0)) {
+                      _selected.clear();
+                    } else {
+                      _selected.addAll(docs!.map((d) => d.id));
+                    }
+                  }),
+                ),
+              ],
+            )
+          : AppBar(
         title: _searching
             ? TextField(
                 autofocus: true,
@@ -169,6 +233,12 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 _query = '';
               }),
             ),
+          if (_docs?.isNotEmpty ?? false)
+            IconButton(
+              tooltip: '선택',
+              icon: const Icon(Icons.checklist_rounded),
+              onPressed: () => setState(() => _selectMode = true),
+            ),
           IconButton(
             tooltip: '앱 정보',
             icon: const Icon(Icons.info_outline_rounded),
@@ -189,14 +259,37 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     itemCount: docs.length,
                     itemBuilder: (_, i) => _DocCard(
                       doc: docs[i],
-                      onTap: () => _open(docs[i]),
-                      onLongPress: () => _menu(docs[i]),
+                      selectMode: _selectMode,
+                      selected: _selected.contains(docs[i].id),
+                      onTap: () => _selectMode ? _toggle(docs[i]) : _open(docs[i]),
+                      // 길게 누르면 선택 모드로
+                      onLongPress: () {
+                        HapticFeedback.selectionClick();
+                        setState(() => _selectMode = true);
+                        _toggle(docs[i]);
+                      },
+                      onMenu: () => _menu(docs[i]),
                     ),
                   ),
                 ),
+      bottomNavigationBar: !_selectMode
+          ? null
+          : SafeArea(
+              child: Container(
+                padding: const EdgeInsets.fromLTRB(16, 10, 16, 12),
+                decoration: const BoxDecoration(
+                    color: AppColors.surface, border: Border(top: BorderSide(color: Colors.white10))),
+                child: FilledButton.icon(
+                  style: FilledButton.styleFrom(backgroundColor: Colors.redAccent, foregroundColor: Colors.white),
+                  onPressed: _selected.isEmpty ? null : _deleteSelected,
+                  icon: const Icon(Icons.delete_outline_rounded),
+                  label: Text(_selected.isEmpty ? '삭제할 문서를 고르세요' : '${_selected.length}개 삭제'),
+                ),
+              ),
+            ),
       floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
       // 주 행동: 스캔 시작 · 보조: 갤러리 사진으로 시작
-      floatingActionButton: Row(mainAxisSize: MainAxisSize.min, children: [
+      floatingActionButton: _selectMode ? null : Row(mainAxisSize: MainAxisSize.min, children: [
         Material(
           color: AppColors.card,
           shape: const CircleBorder(side: BorderSide(color: Colors.white24)),
@@ -228,11 +321,21 @@ String _date(DateTime d) {
 }
 
 class _DocCard extends StatelessWidget {
-  const _DocCard({required this.doc, required this.onTap, required this.onLongPress});
+  const _DocCard({
+    required this.doc,
+    required this.onTap,
+    required this.onLongPress,
+    required this.onMenu,
+    this.selectMode = false,
+    this.selected = false,
+  });
 
   final ScanDoc doc;
   final VoidCallback onTap;
   final VoidCallback onLongPress;
+  final VoidCallback onMenu;
+  final bool selectMode;
+  final bool selected;
 
   @override
   Widget build(BuildContext context) {
@@ -270,6 +373,38 @@ class _DocCard extends StatelessWidget {
                         // 같은 경로라도 수정되면 새로 읽도록
                         key: ValueKey('${doc.thumbPath}${doc.updated}')),
               ),
+            ),
+            // 선택 표시 / 메뉴 버튼
+            if (selectMode)
+              Positioned.fill(
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(16),
+                    color: selected ? AppColors.accent.withValues(alpha: .18) : Colors.black26,
+                    border: Border.all(color: selected ? AppColors.accent : Colors.transparent, width: 3),
+                  ),
+                ),
+              ),
+            Positioned(
+              right: 4,
+              top: 4,
+              child: selectMode
+                  ? Padding(
+                      padding: const EdgeInsets.all(6),
+                      child: Icon(selected ? Icons.check_circle_rounded : Icons.radio_button_unchecked,
+                          color: selected ? AppColors.accent : Colors.white,
+                          size: 26,
+                          shadows: const [Shadow(blurRadius: 6)]),
+                    )
+                  : Material(
+                      color: Colors.black45,
+                      shape: const CircleBorder(),
+                      child: IconButton(
+                        visualDensity: VisualDensity.compact,
+                        icon: const Icon(Icons.more_vert_rounded, size: 20),
+                        onPressed: onMenu,
+                      ),
+                    ),
             ),
             Positioned(
               right: 8,

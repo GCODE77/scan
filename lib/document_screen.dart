@@ -27,6 +27,34 @@ class DocumentScreen extends StatefulWidget {
 
 class _DocumentScreenState extends State<DocumentScreen> {
   List<ScanPage> get _pages => widget.doc.pages;
+
+  /// 선택 모드 (선택한 페이지 없이도 켤 수 있게)
+  bool _selectMode = false;
+
+  Future<bool> _confirm(String title, String body) async =>
+      await showDialog<bool>(
+        context: context,
+        builder: (d) => AlertDialog(
+          title: Text(title),
+          content: Text(body),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('취소')),
+            FilledButton(
+                style: FilledButton.styleFrom(backgroundColor: Colors.redAccent),
+                onPressed: () => Navigator.pop(d, true),
+                child: const Text('삭제')),
+          ],
+        ),
+      ) ==
+      true;
+
+  /// 문서 전체 삭제 (페이지를 비우고 닫으면 보관함에서 지워진다)
+  Future<void> _deleteDoc() async {
+    final ok = await _confirm('이 문서를 삭제할까요?', '${widget.doc.name} (${_pages.length}페이지)\n삭제하면 되돌릴 수 없습니다.');
+    if (!ok || !mounted) return;
+    _pages.clear();
+    Navigator.pop(context);
+  }
   bool _reorder = false;
 
   @override
@@ -159,11 +187,16 @@ class _DocumentScreenState extends State<DocumentScreen> {
   @override
   Widget build(BuildContext context) {
     final pending = _pages.where((p) => p.ocr == null).length;
-    final selecting = _selected.isNotEmpty;
+    final selecting = _selectMode || _selected.isNotEmpty;
     return Scaffold(
       appBar: AppBar(
         leading: selecting
-            ? IconButton(icon: const Icon(Icons.close), onPressed: () => setState(_selected.clear))
+            ? IconButton(
+                icon: const Icon(Icons.close),
+                onPressed: () => setState(() {
+                      _selected.clear();
+                      _selectMode = false;
+                    }))
             : null,
         title: selecting
             ? Text('${_selected.length}개 선택')
@@ -197,28 +230,58 @@ class _DocumentScreenState extends State<DocumentScreen> {
               icon: const Icon(Icons.share_rounded),
               onPressed: _busy ? null : () => shareDocument(context, _pages, widget.doc.name),
             ),
-          if (!selecting && _pages.length > 1)
+          if (!selecting && _pages.isNotEmpty)
             IconButton(
-              tooltip: '순서 바꾸기',
-              icon: const Icon(Icons.swap_vert_rounded),
-              onPressed: () => setState(() => _reorder = true),
+              tooltip: '선택해서 삭제·저장',
+              icon: const Icon(Icons.checklist_rounded),
+              onPressed: () => setState(() => _selectMode = true),
+            ),
+          if (!selecting)
+            PopupMenuButton<String>(
+              onSelected: (v) {
+                if (v == 'reorder') setState(() => _reorder = true);
+                if (v == 'delete') _deleteDoc();
+              },
+              itemBuilder: (_) => [
+                if (_pages.length > 1)
+                  const PopupMenuItem(
+                      value: 'reorder',
+                      child: ListTile(leading: Icon(Icons.swap_vert_rounded), title: Text('순서 바꾸기'))),
+                const PopupMenuItem(
+                    value: 'delete',
+                    child: ListTile(
+                        leading: Icon(Icons.delete_outline_rounded, color: Colors.redAccent),
+                        title: Text('문서 삭제', style: TextStyle(color: Colors.redAccent)))),
+              ],
             ),
           if (selecting) ...[
-            IconButton(
-              tooltip: '모두 선택',
-              icon: const Icon(Icons.select_all_rounded),
-              onPressed: () => setState(() => _selected.addAll(_pages)),
+            TextButton(
+              onPressed: () => setState(() {
+                if (_selected.length == _pages.length) {
+                  _selected.clear();
+                } else {
+                  _selected.addAll(_pages);
+                }
+              }),
+              child: Text(_selected.length == _pages.length ? '선택 해제' : '전체 선택'),
             ),
             IconButton(
-              tooltip: '삭제',
-              icon: const Icon(Icons.delete_outline_rounded),
-              onPressed: () {
-                setState(() {
-                  _pages.removeWhere(_selected.contains);
-                  _selected.clear();
-                });
-                _persist();
-              },
+              tooltip: '선택한 페이지 삭제',
+              icon: const Icon(Icons.delete_outline_rounded, color: Colors.redAccent),
+              onPressed: _selected.isEmpty
+                  ? null
+                  : () async {
+                      final n = _selected.length;
+                      final ok = await _confirm('페이지 $n장을 삭제할까요?', '삭제하면 되돌릴 수 없습니다.');
+                      if (!ok) return;
+                      setState(() {
+                        _pages.removeWhere(_selected.contains);
+                        _selected.clear();
+                        _selectMode = false;
+                      });
+                      _persist();
+                      if (_pages.isEmpty && mounted) Navigator.of(this.context).pop();
+                    },
             ),
           ],
           ],
@@ -245,6 +308,7 @@ class _DocumentScreenState extends State<DocumentScreen> {
                   child: PageGrid(
                     pages: _pages,
                     selected: _selected,
+                    selectMode: selecting,
                     onTap: (i) => selecting ? _toggle(i) : _edit(i),
                     onLongPress: _toggle,
                   ),

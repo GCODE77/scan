@@ -12,7 +12,10 @@ class PageGrid extends StatelessWidget {
     required this.selected,
     required this.onTap,
     required this.onLongPress,
+    this.selectMode = false,
   });
+
+  final bool selectMode;
 
   final List<ScanPage> pages;
   final Set<ScanPage> selected;
@@ -73,7 +76,7 @@ class PageGrid extends StatelessWidget {
                     ]),
                   ),
                 ),
-                if (selected.isNotEmpty)
+                if (selectMode || selected.isNotEmpty)
                   Positioned(
                     right: 6,
                     top: 6,
