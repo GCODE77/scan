@@ -48,6 +48,10 @@ class ScanPage {
   /// 필터 강도 0~1
   double strength = 1;
 
+  /// 자동 정리(손가락·그림자·빛 반사)를 했는지, 되돌리기용 원래 이미지 (앱을 켜 있는 동안만)
+  bool cleaned = false;
+  Uint8List? rawFlat;
+
   /// 페이지에 얹은 서명들
   final List<Stamp> stamps = [];
   Uint8List jpg;

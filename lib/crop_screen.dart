@@ -35,15 +35,28 @@ class _CropScreenState extends State<CropScreen> {
   int? _snapped;
   int _snapSeq = 0;
 
+  /// 자석 켜기/끄기 (앱을 켜 있는 동안 기억)
+  static bool _magnetOn = true;
+
+  /// 끌기 시작한 위치 (원래 자리로 되끌려가지 않게)
+  Offset? _dragFrom;
+
   /// 놓은 모서리를 근처의 실제 종이 모서리에 붙인다. 선들은 함께 따라온다.
   Future<void> _snap(int handle) async {
     final corner = _cornerOf[handle];
     if (corner == null) return;
     final seq = ++_snapSeq;
     final quad = [_shape.top.first, _shape.top.last, _shape.bottom.last, _shape.bottom.first];
+    if (!_magnetOn) return;
+    final drop = _point(handle), from = _dragFrom;
     final p = (await compute(snapCorners, (_jpg, quad, [corner])))[corner];
     // 그 사이 다른 점을 잡았으면 무시
     if (!mounted || p == null || seq != _snapSeq || _dragging != null) return;
+    // 약한 자석: 놓은 곳 근처(대각선의 6%)에 모서리가 있을 때만 붙는다
+    final diag = ((quad[2] - quad[0]).distance + (quad[3] - quad[1]).distance) / 2;
+    if ((p - drop).distance > diag * 0.06) return;
+    // 일부러 옮겼는데 원래 자리 쪽으로 되돌아가는 것이면 붙이지 않는다
+    if (from != null && (p - from).distance < (drop - from).distance * 0.6) return;
     HapticFeedback.selectionClick();
     setState(() {
       _setPoint(handle, p);
@@ -123,9 +136,19 @@ class _CropScreenState extends State<CropScreen> {
       backgroundColor: Colors.black,
       appBar: AppBar(
         backgroundColor: Colors.black,
+        actions: [
+          // 자석 켜기/끄기
+          TextButton.icon(
+            onPressed: () => setState(() => _magnetOn = !_magnetOn),
+            icon: Icon(Icons.attractions_rounded,
+                color: _magnetOn ? const Color(0xFF4FE3C1) : Colors.white38),
+            label: Text(_magnetOn ? '자석 켬' : '자석 끔',
+                style: TextStyle(color: _magnetOn ? const Color(0xFF4FE3C1) : Colors.white54)),
+          ),
+        ],
         title: const Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Text('윤곽 수정'),
-          Text('모서리는 놓으면 종이 끝에 자동으로 붙어요 · 가운데 점은 굴곡',
+          Text('모서리는 종이 끝 가까이 놓으면 붙어요 · 가운데 점은 굴곡',
               style: TextStyle(fontSize: 12, color: Colors.white60)),
         ]),
       ),
@@ -150,6 +173,7 @@ class _CropScreenState extends State<CropScreen> {
                 return GestureDetector(
                   onPanStart: (e) {
                     _snapSeq++;
+                    _dragFrom = null;
                     // 손가락에서 가장 가까운 조절점을 잡는다
                     int? best;
                     for (final i in _visible) {
@@ -158,7 +182,10 @@ class _CropScreenState extends State<CropScreen> {
                         best = i;
                       }
                     }
-                    if (best != null && (handles[best] - e.localPosition).distance < 56) _dragging = best;
+                    if (best != null && (handles[best] - e.localPosition).distance < 56) {
+                      _dragging = best;
+                      _dragFrom = _point(best);
+                    }
                   },
                   onPanUpdate: (e) {
                     final i = _dragging;

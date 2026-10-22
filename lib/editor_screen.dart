@@ -74,6 +74,35 @@ class _EditorScreenState extends State<EditorScreen> {
         await _page.render();
       });
 
+  /// 자동 정리: 손가락 지우기 + 그림자·빛 반사 고르게. 다시 누르면 되돌린다.
+  Future<void> _clean() async {
+    final p = _page;
+    if (p.cleaned) {
+      if (p.rawFlat == null) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text('되돌리려면 "자르기" → "이대로 펴기"로 다시 펴 주세요')));
+        return;
+      }
+      await _work(() async {
+        p.flat = p.rawFlat!;
+        p.rawFlat = null;
+        p.cleaned = false;
+        await p.render();
+      });
+      return;
+    }
+    await _work(() async {
+      p.rawFlat = p.flat;
+      p.flat = await compute(cleanPage, p.flat);
+      p.cleaned = true;
+      await p.render();
+    });
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('손가락·그림자·빛 반사를 정리했어요 (다시 누르면 되돌림)')));
+    }
+  }
+
   /// 서명 넣기 (이미 있으면 추가/모두 지우기 선택)
   Future<void> _sign() async {
     final p = _page;
@@ -405,6 +434,8 @@ class _EditorScreenState extends State<EditorScreen> {
                     _Tool(Icons.rotate_right, '오른쪽', _busy ? null : () => _rotate(1)),
                     _Tool(Icons.crop, '자르기', _busy ? null : _crop),
                     _Tool(Icons.text_fields, '텍스트 추출', _busy ? null : _extractText),
+                    _Tool(_page.cleaned ? Icons.auto_fix_off_rounded : Icons.auto_fix_high_rounded,
+                        _page.cleaned ? '정리 취소' : '자동 정리', _busy ? null : _clean),
                     _Tool(Icons.draw_rounded, '서명', _busy ? null : _sign),
                   ]),
                 ),

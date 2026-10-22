@@ -1312,3 +1312,59 @@ Future<Uint8List> stampPage((Uint8List, List<(Uint8List, double, double, double,
   }
   return _encode(cv.Mat.fromList(ph, pw, cv.MatType.CV_8UC3, pd));
 }
+
+/// isolate에서 실행된다: 자동 정리 — 손가락 지우기, 그림자·빛 반사 고르게.
+Future<Uint8List> cleanPage(Uint8List flat) async {
+  var img = cv.imdecode(flat, cv.IMREAD_COLOR);
+  final w = img.cols, h = img.rows, n = w * h;
+
+  // 종이 바탕 추정: 글씨(어두운 점)를 지우고 크게 흐림 → 그 자리의 종이 색
+  final k = math.max(9, (math.max(w, h) / 120).round() | 1);
+  final bg = cv.medianBlur(cv.dilate(img, cv.getStructuringElement(cv.MORPH_RECT, (k, k))), 41);
+
+  // 1) 손가락: 사진 가장자리에서 들어온 피부색 덩어리
+  final ycc = Uint8List.fromList(cv.cvtColor(img, cv.COLOR_BGR2YCrCb).data);
+  final skin = Uint8List(n);
+  for (var i = 0; i < n; i++) {
+    final y = ycc[i * 3], cr = ycc[i * 3 + 1], cb = ycc[i * 3 + 2];
+    if (y > 40 && cr > 135 && cr < 180 && cb > 77 && cb < 130) skin[i] = 255;
+  }
+  var sm = cv.Mat.fromList(h, w, cv.MatType.CV_8UC1, skin);
+  sm = cv.morphologyEx(sm, cv.MORPH_OPEN, cv.getStructuringElement(cv.MORPH_RECT, (5, 5)));
+  sm = cv.morphologyEx(sm, cv.MORPH_CLOSE, cv.getStructuringElement(cv.MORPH_RECT, (11, 11)));
+  final labels = cv.Mat.empty(), stats = cv.Mat.empty(), cents = cv.Mat.empty();
+  final cnt = cv.connectedComponentsWithStats(sm, labels, stats, cents, 8, cv.MatType.CV_32S, -1);
+  final finger = List<bool>.filled(cnt, false);
+  for (var i = 1; i < cnt; i++) {
+    final x = stats.at<int>(i, 0), y = stats.at<int>(i, 1);
+    final bw = stats.at<int>(i, 2), bh = stats.at<int>(i, 3), area = stats.at<int>(i, 4);
+    final touches = x <= 3 || y <= 3 || x + bw >= w - 3 || y + bh >= h - 3;
+    finger[i] = touches && area > n * 0.001 && area < n * 0.25;
+  }
+  if (finger.contains(true)) {
+    final lab = Uint8List.fromList(labels.data).buffer.asInt32List();
+    final m = Uint8List(n);
+    for (var i = 0; i < n; i++) {
+      if (finger[lab[i]]) m[i] = 255;
+    }
+    final mask = cv.dilate(cv.Mat.fromList(h, w, cv.MatType.CV_8UC1, m),
+        cv.getStructuringElement(cv.MORPH_ELLIPSE, (17, 17)));
+    // 손가락 자리는 주변 종이 색으로 메운다
+    final md = mask.data, id = Uint8List.fromList(img.data), bd = bg.data;
+    for (var i = 0; i < n; i++) {
+      if (md[i] > 0) {
+        id[i * 3] = bd[i * 3];
+        id[i * 3 + 1] = bd[i * 3 + 1];
+        id[i * 3 + 2] = bd[i * 3 + 2];
+      }
+    }
+    img = cv.Mat.fromList(h, w, cv.MatType.CV_8UC3, id);
+  }
+
+  // 2) 그림자·빛 반사: 채널마다 종이 바탕으로 나눠 밝기를 고르게 (색은 유지)
+  final ch = cv.split(img), bch = cv.split(bg);
+  final flatCh = [for (var c = 0; c < 3; c++) cv.divide(ch[c], bch[c], scale: 240)];
+  final even = cv.merge(cv.VecMat.fromList(flatCh));
+  // 원래 사진 느낌을 조금 남긴다
+  return _encode(cv.addWeighted(img, 0.25, even, 0.75, 0));
+}
