@@ -1003,20 +1003,44 @@ cv.Mat _applyMode(cv.Mat out, ScanMode mode, [double strength = 1]) {
   return cv.addWeighted(out, 1 - strength, f, strength, 0);
 }
 
-/// 글자 인식(OCR)용 이미지: 그림자 제거한 회색, 긴 변 2400px 이하
-Future<(Uint8List, double)> ocrImage((Uint8List, int) args) async {
+/// 글자 인식(OCR)용 이미지 묶음. 여러 방식으로 만들어 두고 가장 잘 읽히는 쪽을 쓴다.
+/// 결과: 묶음 이름 → [(PNG, 배율, 페이지에서의 x, y 위치)] (배율·위치로 페이지 좌표에 되돌린다)
+Future<Map<String, List<(Uint8List, double, double, double)>>> ocrImages((Uint8List, int) args) async {
   final (flat, quarterTurns) = args;
   var img = cv.imdecode(flat, cv.IMREAD_COLOR);
-  final s = math.min(1.0, 2400 / math.max(img.cols, img.rows));
-  if (s < 1) img = cv.resize(img, ((img.cols * s).round(), (img.rows * s).round()), interpolation: cv.INTER_AREA);
-  final gray = cv.cvtColor(img, cv.COLOR_BGR2GRAY);
-  final bg = cv.medianBlur(cv.dilate(gray, cv.getStructuringElement(cv.MORPH_RECT, (7, 7))), 21);
-  var out = cv.divide(gray, bg, scale: 255);
   final r = quarterTurns % 4;
   if (r != 0) {
-    out = cv.rotate(out, const [0, cv.ROTATE_90_CLOCKWISE, cv.ROTATE_180, cv.ROTATE_90_COUNTERCLOCKWISE][r]);
+    img = cv.rotate(img, const [0, cv.ROTATE_90_CLOCKWISE, cv.ROTATE_180, cv.ROTATE_90_COUNTERCLOCKWISE][r]);
   }
-  return (cv.imencode('.png', out).$2, s);
+  final w = img.cols, h = img.rows;
+
+  // 그림자를 걷어낸 회색 (대비가 또렷해진다)
+  final gray = cv.cvtColor(img, cv.COLOR_BGR2GRAY);
+  final bg = cv.medianBlur(cv.dilate(gray, cv.getStructuringElement(cv.MORPH_RECT, (7, 7))), 21);
+  final clean = cv.divide(gray, bg, scale: 255);
+
+  (Uint8List, double, double, double) fit(cv.Mat m, double target, double ox, double oy) {
+    final s = target / math.max(m.cols, m.rows);
+    final out = (s - 1).abs() < 0.02
+        ? m
+        : cv.resize(m, ((m.cols * s).round(), (m.rows * s).round()),
+            interpolation: s < 1 ? cv.INTER_AREA : cv.INTER_CUBIC);
+    return (cv.imencode('.png', out).$2, s, ox, oy);
+  }
+
+  final res = <String, List<(Uint8List, double, double, double)>>{
+    'clean': [fit(clean, math.min(2400.0, math.max(w, h).toDouble()), 0, 0)],
+    'color': [fit(img, math.min(2400.0, math.max(w, h).toDouble()), 0, 0)],
+  };
+  // 위·아래 반씩 나눠 크게 확대 (작은 글씨에 효과적). 겹치는 띠 10%
+  if (math.max(w, h) >= 1200) {
+    final cut = (h * 0.55).round(), from = (h * 0.45).round();
+    res['tiles'] = [
+      fit(clean.region(cv.Rect(0, 0, w, cut)).clone(), 2400, 0, 0),
+      fit(clean.region(cv.Rect(0, from, w, h - from)).clone(), 2400, 0, from.toDouble()),
+    ];
+  }
+  return res;
 }
 
 /// isolate에서 실행된다: 윤곽대로 편 원본 색 JPG 목록 (양면이면 왼쪽, 오른쪽 2장).

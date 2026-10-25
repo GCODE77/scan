@@ -430,8 +430,9 @@ class _EditorScreenState extends State<EditorScreen> {
                   scrollDirection: Axis.horizontal,
                   child: Row(children: [
                     _Tool(Icons.camera_alt_outlined, '다시 찍기', _busy ? null : _retake),
-                    _Tool(Icons.rotate_left, '왼쪽', _busy ? null : () => _rotate(-1)),
-                    _Tool(Icons.rotate_right, '오른쪽', _busy ? null : () => _rotate(1)),
+                    // 누르면 오른쪽 90°, 길게 누르면 왼쪽 90°
+                    _Tool(Icons.rotate_right, '회전', _busy ? null : () => _rotate(1),
+                        onLongPress: _busy ? null : () => _rotate(-1)),
                     _Tool(Icons.crop, '자르기', _busy ? null : _crop),
                     _Tool(Icons.text_fields, '텍스트 추출', _busy ? null : _extractText),
                     _Tool(_page.cleaned ? Icons.auto_fix_off_rounded : Icons.auto_fix_high_rounded,
@@ -484,11 +485,12 @@ class _EditorScreenState extends State<EditorScreen> {
 }
 
 class _Tool extends StatelessWidget {
-  const _Tool(this.icon, this.label, this.onTap);
+  const _Tool(this.icon, this.label, this.onTap, {this.onLongPress});
 
   final IconData icon;
   final String label;
   final VoidCallback? onTap;
+  final VoidCallback? onLongPress;
 
   @override
   Widget build(BuildContext context) {
@@ -496,6 +498,7 @@ class _Tool extends StatelessWidget {
       width: 70,
       child: InkWell(
         onTap: onTap,
+        onLongPress: onLongPress,
         borderRadius: BorderRadius.circular(12),
         child: Padding(
           padding: const EdgeInsets.symmetric(vertical: 6),

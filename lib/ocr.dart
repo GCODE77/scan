@@ -82,24 +82,45 @@ class Ocr {
   static final _recognizer = TextRecognizer(script: TextRecognitionScript.korean);
   static var _seq = 0;
 
-  /// 페이지 글자 인식. 필터를 입힌 사진 대신 '그림자 없앤 회색' 이미지로 읽어서 정확도를 높이고,
-  /// 결과 위치는 페이지 이미지(jpg) 좌표로 돌려준다.
+  /// 페이지 글자 인식. 그림자 없앤 회색 / 원본 색 / 위·아래 확대 조각을 각각 읽어
+  /// '글자 수 × 신뢰도'가 가장 높은 결과를 고른다. 위치는 페이지 이미지(jpg) 좌표로 돌려준다.
   static Future<OcrResult> recognize(ScanPage page) async {
-    final (img, scale) = await compute(ocrImage, (page.flat, page.quarterTurns));
+    final groups = await compute(ocrImages, (page.flat, page.quarterTurns));
     final dir = await getTemporaryDirectory();
-    final file = File('${dir.path}/ocr_${_seq++}.png');
-    await file.writeAsBytes(img);
-    try {
-      final result = await _recognizer.processImage(InputImage.fromFilePath(file.path));
-      Rect back(Rect r) =>
-          Rect.fromLTRB(r.left / scale, r.top / scale, r.right / scale, r.bottom / scale);
-      return OcrResult([
-        for (final block in result.blocks)
-          for (final line in block.lines)
-            if (line.text.trim().isNotEmpty) OcrLine(line.text, back(line.boundingBox)),
-      ]);
-    } finally {
-      file.delete().ignore();
+    OcrResult? best;
+    var bestScore = -1.0;
+    for (final parts in groups.values) {
+      final lines = <(OcrLine, double)>[];
+      for (final (png, scale, ox, oy) in parts) {
+        final file = File('${dir.path}/ocr_${_seq++}.png');
+        await file.writeAsBytes(png);
+        try {
+          final result = await _recognizer.processImage(InputImage.fromFilePath(file.path));
+          for (final block in result.blocks) {
+            for (final line in block.lines) {
+              if (line.text.trim().isEmpty) continue;
+              final b = line.boundingBox;
+              final box = Rect.fromLTRB(
+                  b.left / scale + ox, b.top / scale + oy, b.right / scale + ox, b.bottom / scale + oy);
+              // 조각이 겹치는 띠에서 이미 읽은 줄은 건너뛴다
+              final dup = lines.any((e) {
+                final o = e.$1.box.intersect(box);
+                return o.width > 0 && o.height > 0 && o.width * o.height > 0.4 * box.width * box.height;
+              });
+              if (!dup) lines.add((OcrLine(line.text, box), line.confidence ?? 0.7));
+            }
+          }
+        } finally {
+          file.delete().ignore();
+        }
+      }
+      final score = lines.fold<double>(0, (s, e) => s + e.$1.text.replaceAll(' ', '').length * e.$2);
+      if (score > bestScore) {
+        bestScore = score;
+        // 읽는 순서는 인식기가 묶은 문단 순서 그대로 (2단 문서가 섞이지 않게)
+        best = OcrResult([for (final e in lines) e.$1]);
+      }
     }
+    return best ?? OcrResult([]);
   }
 }

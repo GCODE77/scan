@@ -19,6 +19,15 @@ class Stamp {
 
 const _inkColors = [Color(0xFF111111), Color(0xFF1A3FB5), Color(0xFFC62828)];
 
+/// 서명 글씨체: (글꼴 이름, 화면 표시 이름). null = 기본 고딕
+const _fonts = <(String?, String)>[
+  ('NanumPen', '펜글씨'),
+  ('NanumBrush', '붓글씨'),
+  ('Gaegu', '손글씨'),
+  ('Dokdo', '개성체'),
+  (null, '고딕'),
+];
+
 /// 서명 만들기: 직접 그리기 / 글자로 입력. 결과는 투명 PNG.
 Future<Uint8List?> makeSignature(BuildContext context) => Navigator.push<Uint8List>(
     context, MaterialPageRoute(fullscreenDialog: true, builder: (_) => const _SignatureMaker()));
@@ -38,7 +47,11 @@ class _SignatureMakerState extends State<_SignatureMaker> {
   Color _color = _inkColors.first;
   final List<List<Offset>> _strokes = [];
   final _text = TextEditingController();
-  bool _italic = true;
+  bool _italic = false;
+  int _font = 0;
+
+  /// 굵기: 그리기는 선 두께(px), 글자는 테두리를 덧대는 두께
+  double _thick = 4;
   Uint8List? _last;
 
   @override
@@ -75,7 +88,7 @@ class _SignatureMakerState extends State<_SignatureMaker> {
     final rec = ui.PictureRecorder();
     final canvas = Canvas(rec)..scale(sc);
     canvas.translate(pad - l, pad - t);
-    _paintStrokes(canvas, _strokes, _color);
+    _paintStrokes(canvas, _strokes, _color, _thick);
     final img = await rec.endRecording().toImage((w * sc).ceil(), (h * sc).ceil());
     return (await img.toByteData(format: ui.ImageByteFormat.png))!.buffer.asUint8List();
   }
@@ -89,18 +102,50 @@ class _SignatureMakerState extends State<_SignatureMaker> {
     )..layout();
     final rec = ui.PictureRecorder();
     final canvas = Canvas(rec);
-    tp.paint(canvas, const Offset(20, 10));
-    final img = await rec.endRecording().toImage(tp.width.ceil() + 40, tp.height.ceil() + 20);
+    const pad = 30.0;
+    if (_thick > 4) {
+      (TextPainter(
+        text: TextSpan(text: text, style: _textStyle(140, stroke: true)),
+        textDirection: TextDirection.ltr,
+      )..layout())
+          .paint(canvas, const Offset(pad, pad / 2));
+    }
+    tp.paint(canvas, const Offset(pad, pad / 2));
+    final img = await rec.endRecording().toImage((tp.width + pad * 2).ceil(), (tp.height + pad).ceil());
     return (await img.toByteData(format: ui.ImageByteFormat.png))!.buffer.asUint8List();
   }
 
-  TextStyle _textStyle(double size) => TextStyle(
-        fontSize: size,
-        color: _color,
-        fontWeight: FontWeight.w600,
-        fontStyle: _italic ? FontStyle.italic : FontStyle.normal,
-        letterSpacing: -size * 0.02,
-      );
+  /// 글자 서명 모양. [stroke]가 true면 같은 글자를 굵기만큼 테두리로 덧그리는 용도.
+  TextStyle _textStyle(double size, {bool stroke = false}) {
+    final base = TextStyle(
+      fontFamily: _fonts[_font].$1,
+      fontSize: size,
+      fontStyle: _italic ? FontStyle.italic : FontStyle.normal,
+      fontWeight: _fonts[_font].$1 == null ? FontWeight.w600 : FontWeight.normal,
+      letterSpacing: -size * 0.01,
+    );
+    // 굵기 4가 기본(덧그리지 않음). 그보다 크면 테두리를 덧대 두껍게
+    final extra = (_thick - 4) * size / 60;
+    if (stroke) {
+      return base.copyWith(
+          foreground: Paint()
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = extra.clamp(0, 999)
+            ..strokeJoin = StrokeJoin.round
+            ..color = _color);
+    }
+    return base.copyWith(color: _color);
+  }
+
+  /// 굵기를 반영해 글자 그리기 (테두리 + 채움)
+  Widget _styledText(String text, double size, {Color? color}) {
+    final fill = _textStyle(size).copyWith(color: color ?? _color);
+    if (_thick <= 4 || color != null) return Text(text, style: fill);
+    return Stack(children: [
+      Text(text, style: _textStyle(size, stroke: true)),
+      Text(text, style: fill),
+    ]);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -167,7 +212,21 @@ class _SignatureMakerState extends State<_SignatureMaker> {
                 onSelected: (v) => setState(() => _italic = v),
               ),
           ]),
-          const SizedBox(height: 12),
+          Row(children: [
+            const Icon(Icons.line_weight_rounded, size: 20, color: Colors.white70),
+            const SizedBox(width: 8),
+            const Text('굵기', style: TextStyle(color: Colors.white70)),
+            Expanded(
+              child: Slider(
+                value: _thick,
+                min: 2,
+                max: 12,
+                divisions: 10,
+                label: _thick.round().toString(),
+                onChanged: (v) => setState(() => _thick = v),
+              ),
+            ),
+          ]),
           SizedBox(
             width: double.infinity,
             child: FilledButton.icon(
@@ -194,7 +253,7 @@ class _SignatureMakerState extends State<_SignatureMaker> {
         GestureDetector(
           onPanStart: (e) => setState(() => _strokes.add([e.localPosition])),
           onPanUpdate: (e) => setState(() => _strokes.last.add(e.localPosition)),
-          child: CustomPaint(painter: _StrokePainter(_strokes, _color), size: Size.infinite),
+          child: CustomPaint(painter: _StrokePainter(_strokes, _color, _thick), size: Size.infinite),
         ),
       ]);
 
@@ -213,26 +272,44 @@ class _SignatureMakerState extends State<_SignatureMaker> {
             ),
             onChanged: (_) => setState(() {}),
           ),
-          const SizedBox(height: 28),
+          const SizedBox(height: 16),
+          // 글씨체 고르기 (각 버튼이 그 글씨체로 보인다)
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(children: [
+              for (var i = 0; i < _fonts.length; i++)
+                Padding(
+                  padding: const EdgeInsets.only(right: 8),
+                  child: ChoiceChip(
+                    label: Text(_fonts[i].$2,
+                        style: TextStyle(fontFamily: _fonts[i].$1, fontSize: 17, color: Colors.black87)),
+                    selected: _font == i,
+                    selectedColor: const Color(0xFFBDF5E6),
+                    backgroundColor: const Color(0xFFF2F3F5),
+                    onSelected: (_) => setState(() => _font = i),
+                  ),
+                ),
+            ]),
+          ),
+          const SizedBox(height: 20),
           FittedBox(
-            child: Text(_text.text.isEmpty ? '홍길동' : _text.text,
-                style: _textStyle(56).copyWith(
-                    color: _text.text.isEmpty ? Colors.black12 : _color)),
+            child: _styledText(_text.text.isEmpty ? '홍길동' : _text.text, 64,
+                color: _text.text.isEmpty ? Colors.black12 : null),
           ),
         ]),
       );
 }
 
-void _paintStrokes(Canvas canvas, List<List<Offset>> strokes, Color color) {
+void _paintStrokes(Canvas canvas, List<List<Offset>> strokes, Color color, double width) {
   final paint = Paint()
     ..color = color
-    ..strokeWidth = 4
+    ..strokeWidth = width
     ..strokeCap = StrokeCap.round
     ..strokeJoin = StrokeJoin.round
     ..style = PaintingStyle.stroke;
   for (final s in strokes) {
     if (s.length == 1) {
-      canvas.drawCircle(s.first, 2, paint..style = PaintingStyle.fill);
+      canvas.drawCircle(s.first, width / 2, paint..style = PaintingStyle.fill);
       paint.style = PaintingStyle.stroke;
       continue;
     }
@@ -248,13 +325,14 @@ void _paintStrokes(Canvas canvas, List<List<Offset>> strokes, Color color) {
 }
 
 class _StrokePainter extends CustomPainter {
-  _StrokePainter(this.strokes, this.color);
+  _StrokePainter(this.strokes, this.color, this.width);
 
   final List<List<Offset>> strokes;
   final Color color;
+  final double width;
 
   @override
-  void paint(Canvas canvas, Size size) => _paintStrokes(canvas, strokes, color);
+  void paint(Canvas canvas, Size size) => _paintStrokes(canvas, strokes, color, width);
 
   @override
   bool shouldRepaint(_StrokePainter old) => true;
