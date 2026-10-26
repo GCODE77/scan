@@ -37,6 +37,91 @@ class _CameraScreenState extends State<CameraScreen> {
   int _processing = 0;
   Future<void> _queue = Future.value();
 
+  // ── 실시간 윤곽 + 자동 셔터 ──
+  /// 자동 셔터 켜기/끄기 (앱을 켜 있는 동안 기억, 기본 끔)
+  static bool _auto = false;
+
+  /// 미리보기에서 찾은 종이 윤곽 (화면 기준 0~1)
+  List<Offset>? _live;
+  bool _analyzing = false;
+  DateTime _lastFrame = DateTime(0);
+  Uint8List? _prevSig;
+
+  /// 연속으로 흔들림 없던 횟수 (자동 셔터 진행도)
+  int _steady = 0;
+  static const _steadyNeed = 4;
+
+  /// 한 장 찍은 뒤에는 화면이 크게 바뀌어야(페이지 넘김) 다음 장을 찍는다
+  bool _armed = true;
+  Uint8List? _shotSig;
+  bool _shooting = false;
+
+  Future<void> _startStream() async {
+    final c = _controller;
+    if (c == null || c.value.isStreamingImages) return;
+    try {
+      await c.startImageStream(_onFrame);
+    } catch (_) {
+      // 미리보기 분석을 못 하는 기기면 그냥 수동 촬영
+    }
+  }
+
+  Future<void> _stopStream() async {
+    final c = _controller;
+    if (c != null && c.value.isStreamingImages) {
+      try {
+        await c.stopImageStream();
+      } catch (_) {}
+    }
+  }
+
+  static double _sigDiff(Uint8List a, Uint8List b) {
+    var d = 0;
+    for (var i = 0; i < a.length && i < b.length; i++) {
+      d += (a[i] - b[i]).abs();
+    }
+    return d / a.length;
+  }
+
+  void _onFrame(CameraImage img) {
+    // 1초에 4번 정도만, 앞 분석이 끝났을 때만
+    final now = DateTime.now();
+    if (_analyzing || _shooting || now.difference(_lastFrame).inMilliseconds < 250) return;
+    _lastFrame = now;
+    _analyzing = true;
+    final pl = img.planes.first;
+    final sensor = _controller?.description.sensorOrientation ?? 90;
+    compute(liveDetect, (Uint8List.fromList(pl.bytes), img.width, img.height, pl.bytesPerRow, sensor))
+        .then((r) {
+      if (!mounted) return;
+      final (quad, sig) = r;
+      final prev = _live, prevSig = _prevSig;
+      _prevSig = sig;
+      // 흔들림: 윤곽 모서리 이동량 + 장면 밝기 변화
+      final motion = prevSig == null ? 99.0 : _sigDiff(sig, prevSig);
+      var moved = 1.0;
+      if (quad != null && prev != null) {
+        moved = 0;
+        for (var i = 0; i < 4; i++) {
+          moved = math.max(moved, (quad[i] - prev[i]).distance);
+        }
+      }
+      // 찍은 뒤 페이지를 넘기는 등 화면이 크게 바뀌면 다음 장 준비
+      if (!_armed && _shotSig != null && _sigDiff(sig, _shotSig!) > 12) _armed = true;
+      final steadyNow = quad != null && moved < 0.015 && motion < 3;
+      setState(() {
+        _live = quad;
+        _steady = steadyNow ? _steady + 1 : 0;
+      });
+      if (_auto && _armed && _steady >= _steadyNeed) {
+        _shotSig = sig;
+        _armed = false;
+        _steady = 0;
+        _shoot();
+      }
+    }).whenComplete(() => _analyzing = false);
+  }
+
   @override
   void initState() {
     super.initState();
@@ -56,6 +141,7 @@ class _CameraScreenState extends State<CameraScreen> {
       await c.setFlashMode(FlashMode.off);
       if (!mounted) return;
       setState(() => _controller = c);
+      _startStream();
     } catch (e) {
       setState(() => _error = '카메라를 열 수 없습니다: $e');
     }
@@ -63,15 +149,25 @@ class _CameraScreenState extends State<CameraScreen> {
 
   @override
   void dispose() {
+    _stopStream();
     _controller?.dispose();
     super.dispose();
   }
 
   Future<void> _shoot() async {
     final c = _controller;
-    if (c == null || c.value.isTakingPicture) return;
+    if (c == null || c.value.isTakingPicture || _shooting) return;
+    _shooting = true;
     HapticFeedback.mediumImpact();
-    final file = await c.takePicture();
+    // 미리보기 분석을 잠시 멈추고 찍는다 (기기에 따라 동시에 못 함)
+    await _stopStream();
+    late final XFile file;
+    try {
+      file = await c.takePicture();
+    } finally {
+      _shooting = false;
+      _startStream();
+    }
     setState(() => _flashEffect = true);
     Future.delayed(const Duration(milliseconds: 120), () {
       if (mounted) setState(() => _flashEffect = false);
@@ -171,6 +267,27 @@ class _CameraScreenState extends State<CameraScreen> {
                 onPressed: () => Navigator.pop(context),
               ),
               const Spacer(),
+              // 자동 셔터 켜기/끄기
+              TextButton.icon(
+                onPressed: () {
+                  setState(() {
+                    _auto = !_auto;
+                    _armed = true;
+                    _steady = 0;
+                  });
+                  ScaffoldMessenger.of(context)
+                    ..hideCurrentSnackBar()
+                    ..showSnackBar(SnackBar(
+                        duration: const Duration(seconds: 2),
+                        content: Text(_auto
+                            ? '자동 촬영 켬 · 종이를 맞추고 잠깐 멈추면 찍혀요. 책은 넘기고 멈추면 다음 장을 찍어요'
+                            : '자동 촬영 끔')));
+                },
+                icon: Icon(_auto ? Icons.motion_photos_auto_rounded : Icons.motion_photos_off_outlined,
+                    color: _auto ? AppColors.accent : Colors.white),
+                label: Text(_auto ? '자동 촬영' : '자동 끔',
+                    style: TextStyle(color: _auto ? AppColors.accent : Colors.white)),
+              ),
               IconButton(
                 icon: Icon(_flashInfo[_flash]!.$1,
                     color: _flash == FlashMode.off ? Colors.white : AppColors.accent),
@@ -191,8 +308,16 @@ class _CameraScreenState extends State<CameraScreen> {
                                   e.localPosition.dy / box.maxHeight)),
                               child: Stack(fit: StackFit.expand, children: [
                               CameraPreview(c),
-                              // 문서를 맞추는 네모 점선 안내
-                              const IgnorePointer(child: CustomPaint(painter: _GuidePainter())),
+                              // 문서를 맞추는 네모 점선 안내 (윤곽을 찾으면 윤곽으로 바뀐다)
+                              if (_live == null)
+                                const IgnorePointer(child: CustomPaint(painter: _GuidePainter())),
+                              if (_live != null)
+                                IgnorePointer(
+                                  child: CustomPaint(
+                                    painter: _LivePainter(
+                                        _live!, _auto && _armed ? _steady / _steadyNeed : -1),
+                                  ),
+                                ),
                               if (_focusAt != null)
                                 Positioned(
                                   left: _focusAt!.dx * box.maxWidth - 36,
@@ -391,4 +516,43 @@ class _GuidePainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_GuidePainter old) => false;
+}
+
+/// 실시간 종이 윤곽. [progress] 0~1이면 자동 촬영까지 남은 정도를 함께 보여 준다 (음수면 표시 안 함).
+class _LivePainter extends CustomPainter {
+  _LivePainter(this.quad, this.progress);
+
+  final List<Offset> quad;
+  final double progress;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final pts = [for (final p in quad) Offset(p.dx * size.width, p.dy * size.height)];
+    final path = Path()..addPolygon(pts, true);
+    canvas.drawPath(path, Paint()..color = const Color(0xFF4FE3C1).withValues(alpha: .18));
+    canvas.drawPath(
+        path,
+        Paint()
+          ..color = const Color(0xFF4FE3C1)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 3
+          ..strokeJoin = StrokeJoin.round);
+    for (final p in pts) {
+      canvas.drawCircle(p, 6, Paint()..color = const Color(0xFF4FE3C1));
+    }
+    if (progress >= 0) {
+      // 가운데 원: 채워지면 찍힌다
+      final c = pts.reduce((a, b) => a + b) / 4;
+      final ring = Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 6
+        ..strokeCap = StrokeCap.round;
+      canvas.drawCircle(c, 34, ring..color = Colors.white24);
+      canvas.drawArc(Rect.fromCircle(center: c, radius: 34), -math.pi / 2,
+          2 * math.pi * progress.clamp(0.0, 1.0), false, ring..color = const Color(0xFF4FE3C1));
+    }
+  }
+
+  @override
+  bool shouldRepaint(_LivePainter old) => true;
 }

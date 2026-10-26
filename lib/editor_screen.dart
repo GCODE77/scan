@@ -35,6 +35,26 @@ class _EditorScreenState extends State<EditorScreen> {
   List<ScanPage> get _pages => widget.pages;
   ScanPage get _page => _pages[_index];
 
+  // ── 되돌리기 ──
+  /// 바꾸기 직전 상태들 (최근 20개)
+  final List<_Snapshot> _history = [];
+
+  void _push() {
+    _history.add(_Snapshot.of(_pages, _index));
+    if (_history.length > 20) _history.removeAt(0);
+  }
+
+  void _undo() {
+    if (_history.isEmpty || _busy) return;
+    HapticFeedback.selectionClick();
+    final snap = _history.removeLast();
+    setState(() {
+      snap.restore(_pages);
+      _index = snap.index.clamp(0, _pages.length - 1);
+    });
+    _pager.jumpToPage(_index);
+  }
+
   Future<void> _work(Future<void> Function() job) async {
     setState(() => _busy = true);
     try {
@@ -51,6 +71,7 @@ class _EditorScreenState extends State<EditorScreen> {
       };
 
   void _setFilter(ScanMode m, {bool all = false}) => _work(() async {
+        _push();
         for (final p in all ? _pages : [_page]) {
           if (p.mode == m) continue;
           p.mode = m;
@@ -61,6 +82,7 @@ class _EditorScreenState extends State<EditorScreen> {
 
   /// 90도 회전 (-1: 왼쪽, 1: 오른쪽)
   void _rotate(int dir) => _work(() async {
+        _push();
         HapticFeedback.selectionClick();
         _page.quarterTurns += dir;
         // 얹은 서명도 페이지와 함께 돈다
@@ -84,6 +106,7 @@ class _EditorScreenState extends State<EditorScreen> {
         return;
       }
       await _work(() async {
+        _push();
         p.flat = p.rawFlat!;
         p.rawFlat = null;
         p.cleaned = false;
@@ -92,6 +115,7 @@ class _EditorScreenState extends State<EditorScreen> {
       return;
     }
     await _work(() async {
+      _push();
       p.rawFlat = p.flat;
       p.flat = await compute(cleanPage, p.flat);
       p.cleaned = true;
@@ -126,6 +150,7 @@ class _EditorScreenState extends State<EditorScreen> {
       if (act == null) return;
       if (act == 'clear') {
         await _work(() async {
+          _push();
           p.stamps.clear();
           await p.render();
         });
@@ -142,6 +167,7 @@ class _EditorScreenState extends State<EditorScreen> {
         context, p.jpg, Size(img.width.toDouble(), img.height.toDouble()), png);
     if (rect == null) return;
     await _work(() async {
+      _push();
       p.stamps.add(Stamp(png, rect));
       await p.render();
     });
@@ -151,6 +177,7 @@ class _EditorScreenState extends State<EditorScreen> {
   double? _strengthDrag;
 
   void _setStrength(double v) => _work(() async {
+        _push();
         _page.strength = v;
         await _page.render();
         _strengthDrag = null;
@@ -184,6 +211,7 @@ class _EditorScreenState extends State<EditorScreen> {
         MaterialPageRoute(builder: (_) => CropScreen(detection: p.det, initial: p.shape)));
     if (shape == null) return;
     await _work(() async {
+      _push();
       final flats = await compute(warpFlat, (p.det.jpg, shape));
       await _replaceGroup(p, [
         for (var i = 0; i < flats.length; i++) ScanPage(det: p.det, shape: shape, part: i, flat: flats[i]),
@@ -196,10 +224,12 @@ class _EditorScreenState extends State<EditorScreen> {
     final fresh = await Navigator.push<List<ScanPage>>(
         context, MaterialPageRoute(builder: (_) => const CameraScreen()));
     if (fresh == null || fresh.isEmpty) return;
+    _push();
     await _work(() => _replaceGroup(p, fresh));
   }
 
   void _delete() {
+    if (_pages.length > 1) _push(); // 마지막 페이지를 지우면 화면이 닫힌다
     setState(() {
       _pages.removeAt(_index);
       if (_index >= _pages.length) _index = _pages.length - 1;
@@ -260,6 +290,13 @@ class _EditorScreenState extends State<EditorScreen> {
         backgroundColor: bg,
         foregroundColor: Colors.white,
         title: Text('편집 · ${_index + 1}/${_pages.length}'),
+        actions: [
+          IconButton(
+            tooltip: '되돌리기',
+            icon: const Icon(Icons.undo_rounded),
+            onPressed: _history.isEmpty || _busy ? null : _undo,
+          ),
+        ],
       ),
       body: Column(children: [
         Expanded(
@@ -597,4 +634,67 @@ class _OutlinePainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_OutlinePainter old) => old.shape != shape || old.scale != scale;
+}
+
+/// 되돌리기용: 페이지 목록과 각 페이지의 상태를 통째로 기억한다.
+class _Snapshot {
+  _Snapshot(this.pages, this.states, this.index);
+
+  factory _Snapshot.of(List<ScanPage> pages, int index) => _Snapshot(
+        List.of(pages),
+        {
+          for (final p in pages)
+            p: (
+              flat: p.flat,
+              rawFlat: p.rawFlat,
+              jpg: p.jpg,
+              mode: p.mode,
+              strength: p.strength,
+              turns: p.quarterTurns,
+              cleaned: p.cleaned,
+              shape: p.shape,
+              ocr: p.ocr,
+              stamps: [for (final st in p.stamps) Stamp(st.png, st.rect, turns: st.turns)],
+            ),
+        },
+        index,
+      );
+
+  final List<ScanPage> pages;
+  final Map<
+      ScanPage,
+      ({
+        Uint8List flat,
+        Uint8List? rawFlat,
+        Uint8List jpg,
+        ScanMode mode,
+        double strength,
+        int turns,
+        bool cleaned,
+        PageShape shape,
+        OcrResult? ocr,
+        List<Stamp> stamps,
+      })> states;
+  final int index;
+
+  void restore(List<ScanPage> target) {
+    target
+      ..clear()
+      ..addAll(pages);
+    for (final MapEntry(key: p, value: s) in states.entries) {
+      p
+        ..flat = s.flat
+        ..rawFlat = s.rawFlat
+        ..jpg = s.jpg
+        ..mode = s.mode
+        ..strength = s.strength
+        ..quarterTurns = s.turns
+        ..cleaned = s.cleaned
+        ..shape = s.shape
+        ..ocr = s.ocr;
+      p.stamps
+        ..clear()
+        ..addAll(s.stamps);
+    }
+  }
 }

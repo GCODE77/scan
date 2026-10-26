@@ -12,6 +12,7 @@ import 'package:pdf/widgets.dart' as pw;
 import 'package:share_plus/share_plus.dart';
 
 import 'ocr.dart';
+import 'pdf_crypt.dart';
 import 'scanner.dart';
 import 'theme.dart';
 
@@ -41,6 +42,11 @@ class SaveOptions {
   bool a4 = false;
   bool searchable = true;
   bool onlySelected = true;
+
+  /// 선택 기능 (기본 끔)
+  bool pageNumbers = false;
+  String? watermark; // 비어 있으면 없음
+  String? password; // 비어 있으면 암호 없음
 }
 
 /// 저장 옵션 시트. 고른 옵션과 저장 방법을 돌려준다.
@@ -51,6 +57,8 @@ Future<(SaveOptions, SaveTarget)?> showSaveSheet(
     ..name = docName.replaceAll(RegExp(r'[\/:*?"<>|]'), '-').replaceAll(' ', '_')
     ..onlySelected = selected > 0;
   final nameCtl = TextEditingController(text: o.name);
+  final pwCtl = TextEditingController(), wmCtl = TextEditingController(text: '사본');
+  var usePw = false, useWm = false;
 
   return showModalBottomSheet<(SaveOptions, SaveTarget)>(
     context: context,
@@ -61,6 +69,8 @@ Future<(SaveOptions, SaveTarget)?> showSaveSheet(
       final count = o.onlySelected ? selected : total;
       void go(SaveTarget t) {
         o.name = nameCtl.text.trim().isEmpty ? o.name : nameCtl.text.trim();
+        o.password = usePw && pwCtl.text.isNotEmpty ? pwCtl.text : null;
+        o.watermark = useWm && wmCtl.text.trim().isNotEmpty ? wmCtl.text.trim() : null;
         Navigator.pop(sheet, (o, t));
       }
 
@@ -136,6 +146,42 @@ Future<(SaveOptions, SaveTarget)?> showSaveSheet(
                     value: o.a4,
                     onChanged: (v) => set(() => o.a4 = v),
                   ),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('페이지 번호'),
+                    subtitle: const Text('아래 가운데에 1 / N', style: TextStyle(color: AppColors.muted)),
+                    value: o.pageNumbers,
+                    onChanged: (v) => set(() => o.pageNumbers = v),
+                  ),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('워터마크'),
+                    subtitle: const Text('페이지 가운데 흐린 글자', style: TextStyle(color: AppColors.muted)),
+                    value: useWm,
+                    onChanged: (v) => set(() => useWm = v),
+                  ),
+                  if (useWm)
+                    TextField(
+                      controller: wmCtl,
+                      decoration: const InputDecoration(
+                          labelText: '워터마크 글자', prefixIcon: Icon(Icons.water_drop_outlined)),
+                    ),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('암호 걸기'),
+                    subtitle: const Text('열 때 암호를 물어요 (영문·숫자)', style: TextStyle(color: AppColors.muted)),
+                    value: usePw,
+                    onChanged: (v) => set(() => usePw = v),
+                  ),
+                  if (usePw)
+                    TextField(
+                      controller: pwCtl,
+                      obscureText: true,
+                      keyboardType: TextInputType.visiblePassword,
+                      inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[\x21-\x7E]'))],
+                      decoration: const InputDecoration(
+                          labelText: '암호 (영문·숫자·기호)', prefixIcon: Icon(Icons.lock_outline_rounded)),
+                    ),
                 ],
                 if (selected > 0 && selected < total)
                   SwitchListTile(
@@ -280,8 +326,15 @@ Future<String?> _deliverOne(String name, Uint8List bytes, String mime, SaveTarge
 /// 검색 가능한 PDF: 페이지 사진 위에 OCR 글자를 보이지 않게 겹쳐 넣는다.
 Future<Uint8List> _buildPdf(List<ScanPage> pages, SaveOptions o, int? maxSide, int quality) async {
   final font = pw.Font.ttf(await rootBundle.load('assets/fonts/NanumGothic-Regular.ttf'));
-  final doc = pw.Document(title: o.name, creator: '북스캔');
+  // 암호를 걸 때는 객체 스트림이 없는 PDF 1.4로 (호환성)
+  final doc = pw.Document(
+      title: o.name, creator: '북스캔', version: o.password != null ? PdfVersion.pdf_1_4 : PdfVersion.pdf_1_5);
+  if (o.password != null) {
+    doc.document.encryption = PdfPasswordEncryption(doc.document, o.password!);
+  }
+  var pageNo = 0;
   for (final p in pages) {
+    final no = ++pageNo; // 페이지는 나중에 그려지므로 번호를 미리 붙잡아 둔다
     final bytes =
         maxSide == null ? p.jpg : await compute(transcode, (p.jpg, 'jpg', maxSide, quality));
     final img = pw.MemoryImage(bytes);
@@ -318,6 +371,36 @@ Future<Uint8List> _buildPdf(List<ScanPage> pages, SaveOptions o, int? maxSide, i
                   ),
                 ),
               ),
+        // 워터마크: 가운데 비스듬히 흐린 글자
+        if (o.watermark != null)
+          pw.Positioned.fill(
+            child: pw.Center(
+              child: pw.Transform.rotate(
+                angle: 0.6,
+                child: pw.Opacity(
+                  opacity: 0.18,
+                  child: pw.Text(o.watermark!,
+                      style: pw.TextStyle(font: font, fontSize: w * 0.12, color: PdfColors.grey800)),
+                ),
+              ),
+            ),
+          ),
+        // 페이지 번호: 아래 가운데
+        if (o.pageNumbers)
+          pw.Positioned(
+            left: 0,
+            right: 0,
+            bottom: 12,
+            child: pw.Center(
+              child: pw.Container(
+                padding: const pw.EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                decoration: pw.BoxDecoration(
+                    color: PdfColors.white, borderRadius: pw.BorderRadius.circular(6)),
+                child: pw.Text('$no / ${pages.length}',
+                    style: pw.TextStyle(font: font, fontSize: 10, color: PdfColors.grey700)),
+              ),
+            ),
+          ),
       ]),
     ));
   }

@@ -1392,3 +1392,49 @@ Future<Uint8List> cleanPage(Uint8List flat) async {
   // 원래 사진 느낌을 조금 남긴다
   return _encode(cv.addWeighted(img, 0.25, even, 0.75, 0));
 }
+
+/// isolate에서 실행된다: 카메라 미리보기 한 장면(밝기 평면)에서 종이 윤곽을 빠르게 찾는다.
+/// (Y 바이트, 너비, 높이, 한 줄 바이트 수, 센서 회전) →
+/// (화면 기준 0~1 네 모서리 [없으면 null], 장면 요약 16×16 밝기 — 움직임 판단용)
+Future<(List<Offset>?, Uint8List)> liveDetect((Uint8List, int, int, int, int) args) async {
+  final (y, w, h, stride, sensor) = args;
+  // 줄 끝 여백이 있으면 잘라서 이어 붙인다
+  final buf = stride == w
+      ? y
+      : Uint8List.fromList([for (var r = 0; r < h; r++) ...y.sublist(r * stride, r * stride + w)]);
+  var g = cv.Mat.fromList(h, w, cv.MatType.CV_8UC1, buf);
+  final s = 320 / math.max(w, h);
+  g = cv.resize(g, ((w * s).round(), (h * s).round()), interpolation: cv.INTER_AREA);
+  // 센서는 보통 가로로 누워 있다 → 화면(세로) 방향으로 돌린다
+  final r = (sensor ~/ 90) % 4;
+  if (r != 0) {
+    g = cv.rotate(g, const [0, cv.ROTATE_90_CLOCKWISE, cv.ROTATE_180, cv.ROTATE_90_COUNTERCLOCKWISE][r]);
+  }
+  final gw = g.cols, gh = g.rows;
+  final sig = Uint8List.fromList(cv.resize(g, (16, 16), interpolation: cv.INTER_AREA).data);
+
+  final blur = cv.gaussianBlur(g, (5, 5), 0);
+  final (_, bin) = cv.threshold(blur, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+  final m = cv.morphologyEx(bin, cv.MORPH_CLOSE, cv.getStructuringElement(cv.MORPH_RECT, (9, 9)));
+  final (contours, _) = cv.findContours(m, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+  var best = -1;
+  var bestA = gw * gh * 0.12;
+  for (var i = 0; i < contours.length; i++) {
+    final a = cv.contourArea(contours[i]);
+    if (a > bestA) {
+      bestA = a;
+      best = i;
+    }
+  }
+  // 화면을 거의 다 채운 덩어리는 종이 윤곽으로 보기 어렵다
+  if (best < 0 || bestA > gw * gh * 0.97) return (null, sig);
+  final hull = cv.VecPoint.fromMat(cv.convexHull(contours[best]));
+  final q = _quadOf(hull);
+  // 사각형다움 확인 (볼록 껍질 넓이 대비 사각형 넓이)
+  final hullA = cv.contourArea(hull);
+  final qa = (((q[1] - q[0]).dx * (q[3] - q[0]).dy - (q[1] - q[0]).dy * (q[3] - q[0]).dx).abs() +
+          ((q[3] - q[2]).dx * (q[1] - q[2]).dy - (q[3] - q[2]).dy * (q[1] - q[2]).dx).abs()) /
+      2;
+  if (qa < hullA * 0.8) return (null, sig);
+  return ([for (final p in q) Offset(p.dx / gw, p.dy / gh)], sig);
+}
