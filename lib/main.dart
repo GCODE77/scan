@@ -38,6 +38,107 @@ class _LibraryScreenState extends State<LibraryScreen> {
   String _query = '';
   bool _searching = false;
 
+  /// 지금 보고 있는 폴더 (null = 전체)
+  String? _folder;
+
+  List<String> get _folders =>
+      ({for (final d in _docs ?? <ScanDoc>[]) ?d.folder}.toList()..sort());
+
+  /// 폴더 고르기 (기존 폴더 / 폴더에서 빼기 / 새 폴더). 취소면 (false, null)
+  Future<(bool, String?)> _pickFolder() async {
+    final ctl = TextEditingController();
+    final r = await showModalBottomSheet<(bool, String?)>(
+      context: context,
+      isScrollControlled: true,
+      builder: (s) => Padding(
+        padding: EdgeInsets.only(bottom: MediaQuery.of(s).viewInsets.bottom),
+        child: SafeArea(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const ListTile(title: Text('폴더로 이동', style: TextStyle(fontWeight: FontWeight.w700))),
+            for (final f in _folders)
+              ListTile(
+                  leading: const Icon(Icons.folder_rounded, color: AppColors.accent),
+                  title: Text(f),
+                  onTap: () => Navigator.pop(s, (true, f))),
+            ListTile(
+                leading: const Icon(Icons.folder_off_outlined),
+                title: const Text('폴더에서 빼기'),
+                onTap: () => Navigator.pop(s, (true, null))),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
+              child: TextField(
+                controller: ctl,
+                decoration: InputDecoration(
+                  labelText: '새 폴더 이름',
+                  prefixIcon: const Icon(Icons.create_new_folder_outlined),
+                  suffixIcon: IconButton(
+                    icon: const Icon(Icons.check_rounded),
+                    onPressed: () {
+                      if (ctl.text.trim().isNotEmpty) Navigator.pop(s, (true, ctl.text.trim()));
+                    },
+                  ),
+                ),
+                onSubmitted: (v) {
+                  if (v.trim().isNotEmpty) Navigator.pop(s, (true, v.trim()));
+                },
+              ),
+            ),
+          ]),
+        ),
+      ),
+    );
+    return r ?? (false, null);
+  }
+
+  Future<void> _moveToFolder(List<ScanDoc> docs) async {
+    final (ok, folder) = await _pickFolder();
+    if (!ok) return;
+    for (final d in docs) {
+      await Store.setFolder(d, folder);
+    }
+    _exitSelect();
+    _refresh();
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(folder == null ? '폴더에서 뺐습니다' : '\'$folder\' 폴더로 옮겼습니다')));
+    }
+  }
+
+  /// 저장 공간 보기 + 원본 사진 줄이기
+  Future<void> _storage() async {
+    String mb(int b) => '${(b / 1024 / 1024).toStringAsFixed(1)}MB';
+    final total = await Store.totalSize();
+    if (!mounted) return;
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (d) => AlertDialog(
+        icon: const Icon(Icons.sd_storage_rounded, color: AppColors.accent, size: 36),
+        title: Text('저장 공간 ${mb(total)}'),
+        content: Text(
+          '문서 ${_docs?.length ?? 0}개 · 페이지 ${_docs?.fold<int>(0, (s, e) => s + e.pageCount) ?? 0}장\n\n'
+          '원본 사진을 줄이면 공간을 크게 아낄 수 있어요. 스캔 결과는 그대로이고, '
+          '나중에 윤곽을 다시 고칠 때 화질만 조금 낮아질 수 있습니다.',
+          style: const TextStyle(height: 1.5),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('닫기')),
+          FilledButton(onPressed: () => Navigator.pop(d, true), child: const Text('원본 사진 줄이기')),
+        ],
+      ),
+    );
+    if (go != true || !mounted) return;
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.showSnackBar(const SnackBar(content: Text('원본 사진을 줄이는 중…')));
+    var saved = 0;
+    for (final d in List.of(_docs ?? <ScanDoc>[])) {
+      saved += await Store.shrinkOriginals(d);
+    }
+    messenger
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text('${mb(saved)}를 아꼈습니다')));
+    _refresh();
+  }
+
   /// 선택 모드 (여러 문서 골라서 삭제)
   bool _selectMode = false;
   final Set<String> _selected = {};
@@ -91,7 +192,13 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   Future<void> _refresh() async {
     final docs = await Store.list();
-    if (mounted) setState(() => _docs = docs);
+    if (mounted) {
+      setState(() {
+        _docs = docs;
+        // 보고 있던 폴더가 비어서 없어졌으면 '전체'로
+        if (_folder != null && !docs.any((d) => d.folder == _folder)) _folder = null;
+      });
+    }
   }
 
   Future<void> _open(ScanDoc doc, {bool scanFirst = false, bool gallery = false}) async {
@@ -128,6 +235,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
               subtitle: const Text('카카오톡·메일 등', style: TextStyle(color: AppColors.muted)),
               onTap: () => Navigator.pop(s, 'share')),
           ListTile(
+              leading: const Icon(Icons.drive_file_move_outline),
+              title: Text(doc.folder == null ? '폴더로 이동' : '폴더 바꾸기 (지금: ${doc.folder})'),
+              onTap: () => Navigator.pop(s, 'folder')),
+          ListTile(
               leading: const Icon(Icons.edit_outlined),
               title: const Text('이름 바꾸기'),
               onTap: () => Navigator.pop(s, 'rename')),
@@ -143,6 +254,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
       await Store.load(doc);
       if (mounted) await shareDocument(context, doc.pages, doc.name);
       doc.pages = [];
+      return;
+    }
+    if (action == 'folder') {
+      await _moveToFolder([doc]);
       return;
     }
     if (action == 'rename') {
@@ -189,7 +304,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
   Widget build(BuildContext context) {
     final docs = _docs
         ?.where((d) => _query.isEmpty || d.name.toLowerCase().contains(_query.toLowerCase()))
+        .where((d) => _folder == null || d.folder == _folder)
         .toList();
+    final folders = _folders;
     return Scaffold(
       appBar: _selectMode
           ? AppBar(
@@ -239,10 +356,16 @@ class _LibraryScreenState extends State<LibraryScreen> {
               icon: const Icon(Icons.checklist_rounded),
               onPressed: () => setState(() => _selectMode = true),
             ),
-          IconButton(
-            tooltip: '앱 정보',
-            icon: const Icon(Icons.info_outline_rounded),
-            onPressed: () => Updater.showAbout(context),
+          PopupMenuButton<String>(
+            onSelected: (v) => v == 'storage' ? _storage() : Updater.showAbout(context),
+            itemBuilder: (_) => const [
+              PopupMenuItem(
+                  value: 'storage',
+                  child: ListTile(leading: Icon(Icons.sd_storage_rounded), title: Text('저장 공간'))),
+              PopupMenuItem(
+                  value: 'about',
+                  child: ListTile(leading: Icon(Icons.info_outline_rounded), title: Text('앱 정보·업데이트'))),
+            ],
           ),
         ],
       ),
@@ -250,7 +373,30 @@ class _LibraryScreenState extends State<LibraryScreen> {
           ? const Center(child: CircularProgressIndicator())
           : _docs!.isEmpty
               ? const _Empty()
-              : RefreshIndicator(
+              : Column(children: [
+                  if (folders.isNotEmpty)
+                    SizedBox(
+                      height: 48,
+                      child: ListView(
+                        scrollDirection: Axis.horizontal,
+                        padding: const EdgeInsets.symmetric(horizontal: 16),
+                        children: [
+                          for (final f in <String?>[null, ...folders])
+                            Padding(
+                              padding: const EdgeInsets.only(right: 8),
+                              child: ChoiceChip(
+                                avatar: Icon(f == null ? Icons.all_inbox_rounded : Icons.folder_rounded,
+                                    size: 18),
+                                label: Text(f ?? '전체'),
+                                selected: _folder == f,
+                                onSelected: (_) => setState(() => _folder = f),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                  Expanded(
+                    child: RefreshIndicator(
                   onRefresh: _refresh,
                   child: GridView.builder(
                     padding: const EdgeInsets.fromLTRB(16, 8, 16, 120),
@@ -272,6 +418,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     ),
                   ),
                 ),
+                  ),
+                ]),
       bottomNavigationBar: !_selectMode
           ? null
           : SafeArea(
@@ -279,12 +427,28 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 padding: const EdgeInsets.fromLTRB(16, 10, 16, 12),
                 decoration: const BoxDecoration(
                     color: AppColors.surface, border: Border(top: BorderSide(color: Colors.white10))),
-                child: FilledButton.icon(
-                  style: FilledButton.styleFrom(backgroundColor: Colors.redAccent, foregroundColor: Colors.white),
-                  onPressed: _selected.isEmpty ? null : _deleteSelected,
-                  icon: const Icon(Icons.delete_outline_rounded),
-                  label: Text(_selected.isEmpty ? '삭제할 문서를 고르세요' : '${_selected.length}개 삭제'),
-                ),
+                child: Row(children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: _selected.isEmpty
+                          ? null
+                          : () => _moveToFolder(_docs!.where((d) => _selected.contains(d.id)).toList()),
+                      icon: const Icon(Icons.drive_file_move_outline),
+                      label: const Text('폴더로'),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    flex: 2,
+                    child: FilledButton.icon(
+                      style: FilledButton.styleFrom(
+                          backgroundColor: Colors.redAccent, foregroundColor: Colors.white),
+                      onPressed: _selected.isEmpty ? null : _deleteSelected,
+                      icon: const Icon(Icons.delete_outline_rounded),
+                      label: Text(_selected.isEmpty ? '문서를 고르세요' : '${_selected.length}개 삭제'),
+                    ),
+                  ),
+                ]),
               ),
             ),
       floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
@@ -297,14 +461,14 @@ class _LibraryScreenState extends State<LibraryScreen> {
             tooltip: '사진에서 가져오기',
             padding: const EdgeInsets.all(14),
             icon: const Icon(Icons.photo_library_rounded),
-            onPressed: () => _open(Store.newDoc(), scanFirst: true, gallery: true),
+            onPressed: () => _open(Store.newDoc()..folder = _folder, scanFirst: true, gallery: true),
           ),
         ),
         const SizedBox(width: 12),
         GradientButton(
           icon: Icons.document_scanner_rounded,
           label: '스캔 시작',
-          onTap: () => _open(Store.newDoc(), scanFirst: true),
+          onTap: () => _open(Store.newDoc()..folder = _folder, scanFirst: true),
         ),
       ]),
     );

@@ -24,6 +24,9 @@ class ScanDoc {
   /// 보관함 목록용 (열지 않아도 아는 정보)
   int pageCount = 0;
   String? thumbPath;
+
+  /// 폴더 이름 (null이면 폴더 없음)
+  String? folder;
 }
 
 /// 기기 안(앱 전용 폴더)에 문서를 보관한다.
@@ -80,7 +83,7 @@ class Store {
         name: j['name'],
         created: DateTime.parse(j['created']),
         updated: DateTime.parse(j['updated']),
-      );
+      )..folder = j['folder'];
 
   /// 문서의 페이지들을 읽어 온다.
   static Future<void> load(ScanDoc doc) async {
@@ -176,6 +179,7 @@ class Store {
       'name': doc.name,
       'created': doc.created.toIso8601String(),
       'updated': doc.updated.toIso8601String(),
+      'folder': doc.folder,
       'pages': [
         for (final p in doc.pages)
           {
@@ -245,5 +249,85 @@ class Store {
     List<Offset> pts(String k) =>
         [for (final p in j[k] as List) Offset((p[0] as num).toDouble(), (p[1] as num).toDouble())];
     return PageShape(pts('top'), pts('bottom'), j['spread']);
+  }
+
+  // ── 폴더 ──
+
+  /// 문서를 폴더로 옮긴다 (null이면 폴더에서 빼기). 페이지를 읽지 않고 정보만 고친다.
+  static Future<void> setFolder(ScanDoc doc, String? folder) async {
+    await _queues[doc.id];
+    final f = File('${(await _docsDir()).path}/${doc.id}/doc.json');
+    if (!await f.exists()) return;
+    final j = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
+    j['folder'] = folder;
+    await f.writeAsString(jsonEncode(j));
+    doc.folder = folder;
+  }
+
+  // ── 저장 공간 ──
+
+  /// 문서 하나가 차지하는 바이트
+  static Future<int> sizeOf(ScanDoc doc) async {
+    final dir = Directory('${(await _docsDir()).path}/${doc.id}');
+    if (!await dir.exists()) return 0;
+    var n = 0;
+    await for (final f in dir.list()) {
+      if (f is File) n += await f.length();
+    }
+    return n;
+  }
+
+  /// 전체 보관함 크기
+  static Future<int> totalSize() async {
+    var n = 0;
+    await for (final e in (await _docsDir()).list(recursive: true)) {
+      if (e is File) n += await e.length();
+    }
+    return n;
+  }
+
+  /// 원본 사진 줄이기: 촬영 원본을 긴 변 [maxSide]px로 줄여 저장 공간을 아낀다.
+  /// 자르기(윤곽 수정)는 계속 되지만 다시 펼 때 화질이 조금 낮아질 수 있다. 줄인 바이트를 돌려준다.
+  static Future<int> shrinkOriginals(ScanDoc doc, {int maxSide = 2000}) async {
+    await _queues[doc.id];
+    final dir = '${(await _docsDir()).path}/${doc.id}';
+    final jf = File('$dir/doc.json');
+    if (!await jf.exists()) return 0;
+    final j = jsonDecode(await jf.readAsString()) as Map<String, dynamic>;
+    final pages = (j['pages'] as List).cast<Map<String, dynamic>>();
+    final scales = <String, double>{}; // 원본 id → 줄인 배율
+    var saved = 0;
+    for (final pj in pages) {
+      final src = pj['src'] as String;
+      if (!scales.containsKey(src)) {
+        final f = File('$dir/src_$src.jpg');
+        final w = (pj['w'] as num).toDouble(), h = (pj['h'] as num).toDouble();
+        final s = maxSide / (w > h ? w : h);
+        if (s >= 0.95 || !await f.exists()) {
+          scales[src] = 1;
+        } else {
+          final before = await f.length();
+          final small = await compute(transcode, (await f.readAsBytes(), 'jpg', maxSide, 85));
+          await f.writeAsBytes(small);
+          saved += before - small.length;
+          scales[src] = s;
+        }
+      }
+      final s = scales[src]!;
+      if (s == 1) continue;
+      // 원본 좌표로 저장된 윤곽들도 같은 배율로 줄인다
+      pj['w'] = ((pj['w'] as num) * s).round();
+      pj['h'] = ((pj['h'] as num) * s).round();
+      for (final key in ['detShape', 'shape']) {
+        final sh = pj[key] as Map<String, dynamic>;
+        for (final edge in ['top', 'bottom']) {
+          sh[edge] = [
+            for (final pt in sh[edge] as List) [(pt[0] as num) * s, (pt[1] as num) * s],
+          ];
+        }
+      }
+    }
+    await jf.writeAsString(jsonEncode(j));
+    return saved;
   }
 }
