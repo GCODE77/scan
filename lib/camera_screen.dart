@@ -154,6 +154,9 @@ class _CameraScreenState extends State<CameraScreen> {
     super.dispose();
   }
 
+  /// 선명도(라플라시안 분산)가 이보다 낮으면 흐린 사진으로 본다
+  static const _blurBelow = 40.0;
+
   Future<void> _shoot() async {
     final c = _controller;
     if (c == null || c.value.isTakingPicture || _shooting) return;
@@ -192,6 +195,15 @@ class _CameraScreenState extends State<CameraScreen> {
         for (final (det, flats) in await compute(autoScan, path)) {
           for (var i = 0; i < flats.length; i++) {
             _pages.add(ScanPage(det: det, shape: det.shape, part: i, flat: flats[i]));
+          }
+          // 초점이 안 맞은 사진이면 바로 알려 준다 (글씨가 흐리면 OCR도 틀린다)
+          final sharp = await compute(sharpness, flats.first);
+          if (sharp >= 0 && sharp < _blurBelow && mounted) {
+            HapticFeedback.heavyImpact();
+            ScaffoldMessenger.of(context)
+              ..hideCurrentSnackBar()
+              ..showSnackBar(SnackBar(
+                  content: Text('${_pages.length}번째 페이지가 흐려요. 다시 찍어 보세요 (편집 화면의 "다시 찍기")')));
           }
         }
       } catch (e) {

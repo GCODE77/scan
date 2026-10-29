@@ -127,6 +127,38 @@ class _EditorScreenState extends State<EditorScreen> {
     }
   }
 
+  /// 빛 반사 제거 / 기울기 보정처럼 편 이미지를 바로 고치는 작업. [all]이면 모든 페이지.
+  /// [job]이 (새 이미지, 변화량)을 주면 적용하고, 변화량이 0이면 건너뛴다. 고친 페이지 수를 돌려준다.
+  Future<int> _fixFlat(Future<(Uint8List, double)> Function(Uint8List) job, {required bool all}) async {
+    var changed = 0;
+    await _work(() async {
+      _push();
+      for (final p in all ? _pages : [_page]) {
+        final (bytes, amount) = await job(p.flat);
+        if (amount == 0) continue;
+        p.flat = bytes;
+        await p.render();
+        changed++;
+      }
+      if (changed == 0) _history.removeLast(); // 바뀐 게 없으면 되돌리기 기록도 남기지 않는다
+    });
+    return changed;
+  }
+
+  void _toast(String msg) {
+    if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  Future<void> _glare({bool all = false}) async {
+    final n = await _fixFlat((f) => compute(glarePage, f), all: all);
+    _toast(n == 0 ? '지울 빛 반사를 찾지 못했어요' : '빛 반사를 지웠어요${all ? ' ($n페이지)' : ''} · 되돌리기로 취소');
+  }
+
+  Future<void> _deskew({bool all = false}) async {
+    final n = await _fixFlat((f) => compute(deskewPage, f), all: all);
+    _toast(n == 0 ? '이미 반듯하거나 기울기를 알 수 없어요' : '기울기를 바로잡았어요${all ? ' ($n페이지)' : ''} · 되돌리기로 취소');
+  }
+
   /// 서명 넣기 (이미 있으면 추가/모두 지우기 선택)
   Future<void> _sign() async {
     final p = _page;
@@ -474,6 +506,11 @@ class _EditorScreenState extends State<EditorScreen> {
                     _Tool(Icons.text_fields, '텍스트 추출', _busy ? null : _extractText),
                     _Tool(_page.cleaned ? Icons.auto_fix_off_rounded : Icons.auto_fix_high_rounded,
                         _page.cleaned ? '정리 취소' : '자동 정리', _busy ? null : _clean),
+                    // 누르면 이 페이지, 길게 누르면 모든 페이지
+                    _Tool(Icons.flare_rounded, '빛반사 제거', _busy ? null : _glare,
+                        onLongPress: _busy ? null : () => _glare(all: true)),
+                    _Tool(Icons.straighten_rounded, '기울기 보정', _busy ? null : _deskew,
+                        onLongPress: _busy ? null : () => _deskew(all: true)),
                     _Tool(Icons.draw_rounded, '서명', _busy ? null : _sign),
                   ]),
                 ),

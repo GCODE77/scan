@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:archive/archive.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -16,7 +17,7 @@ import 'pdf_crypt.dart';
 import 'scanner.dart';
 import 'theme.dart';
 
-enum SaveFormat { pdf, jpg, png, txt }
+enum SaveFormat { pdf, jpg, png, txt, docx, longImage }
 
 enum SaveQuality { high, standard, small }
 
@@ -27,6 +28,8 @@ const _formatInfo = {
   SaveFormat.jpg: (Icons.image_rounded, 'JPG', '페이지별 사진'),
   SaveFormat.png: (Icons.photo_rounded, 'PNG', '무손실 사진'),
   SaveFormat.txt: (Icons.notes_rounded, 'TXT', '인식된 글자'),
+  SaveFormat.docx: (Icons.description_rounded, 'DOCX', '워드로 편집'),
+  SaveFormat.longImage: (Icons.view_day_rounded, '긴 사진', '한 장으로 이어붙임'),
 };
 
 const _qualityInfo = {
@@ -37,11 +40,15 @@ const _qualityInfo = {
 
 class SaveOptions {
   String name = '';
-  SaveFormat format = SaveFormat.pdf;
+  /// 여러 형식을 한 번에 저장할 수 있다 (최소 1개)
+  Set<SaveFormat> formats = {SaveFormat.pdf};
   SaveQuality quality = SaveQuality.high;
   bool a4 = false;
   bool searchable = true;
   bool onlySelected = true;
+
+  /// 파일이 여러 개일 때 ZIP 하나로 묶기
+  bool zip = false;
 
   /// 선택 기능 (기본 끔)
   bool pageNumbers = false;
@@ -49,13 +56,52 @@ class SaveOptions {
   String? password; // 비어 있으면 암호 없음
 }
 
+/// 지난번에 쓴 저장 설정을 기억해 다음에 기본값으로 쓴다 (암호·워터마크는 기억하지 않는다).
+class _SavePrefs {
+  static Future<File> _file() async =>
+      File('${(await getApplicationSupportDirectory()).path}/save_prefs.json');
+
+  static Future<void> load(SaveOptions o) async {
+    try {
+      final f = await _file();
+      if (!await f.exists()) return;
+      final j = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
+      final fm = {
+        for (final n in (j['formats'] as List? ?? []).cast<String>())
+          ...SaveFormat.values.where((v) => v.name == n),
+      };
+      if (fm.isNotEmpty) o.formats = fm;
+      o.quality = SaveQuality.values.firstWhere((v) => v.name == j['quality'], orElse: () => o.quality);
+      o.a4 = j['a4'] == true;
+      o.searchable = j['searchable'] != false;
+      o.pageNumbers = j['pageNumbers'] == true;
+      o.zip = j['zip'] == true;
+    } catch (_) {}
+  }
+
+  static Future<void> save(SaveOptions o) async {
+    try {
+      await (await _file()).writeAsString(jsonEncode({
+        'formats': [for (final f in o.formats) f.name],
+        'quality': o.quality.name,
+        'a4': o.a4,
+        'searchable': o.searchable,
+        'pageNumbers': o.pageNumbers,
+        'zip': o.zip,
+      }));
+    } catch (_) {}
+  }
+}
+
 /// 저장 옵션 시트. 고른 옵션과 저장 방법을 돌려준다.
 Future<(SaveOptions, SaveTarget)?> showSaveSheet(
-    BuildContext context, int total, int selected, String docName) {
+    BuildContext context, int total, int selected, String docName) async {
   final o = SaveOptions()
     // 파일 이름에 쓸 수 없는 글자는 바꾼다
     ..name = docName.replaceAll(RegExp(r'[\/:*?"<>|]'), '-').replaceAll(' ', '_')
     ..onlySelected = selected > 0;
+  await _SavePrefs.load(o);
+  if (!context.mounted) return null;
   final nameCtl = TextEditingController(text: o.name);
   final pwCtl = TextEditingController(), wmCtl = TextEditingController(text: '사본');
   var usePw = false, useWm = false;
@@ -65,12 +111,15 @@ Future<(SaveOptions, SaveTarget)?> showSaveSheet(
     isScrollControlled: true,
     backgroundColor: Colors.transparent,
     builder: (sheet) => StatefulBuilder(builder: (sheet, set) {
-      final isImage = o.format == SaveFormat.jpg || o.format == SaveFormat.png;
+      final hasPdf = o.formats.contains(SaveFormat.pdf);
+      const imageFormats = {SaveFormat.jpg, SaveFormat.png, SaveFormat.longImage};
+      final imagesOnly = o.formats.every(imageFormats.contains);
       final count = o.onlySelected ? selected : total;
       void go(SaveTarget t) {
         o.name = nameCtl.text.trim().isEmpty ? o.name : nameCtl.text.trim();
         o.password = usePw && pwCtl.text.isNotEmpty ? pwCtl.text : null;
         o.watermark = useWm && wmCtl.text.trim().isNotEmpty ? wmCtl.text.trim() : null;
+        _SavePrefs.save(o);
         Navigator.pop(sheet, (o, t));
       }
 
@@ -104,18 +153,22 @@ Future<(SaveOptions, SaveTarget)?> showSaveSheet(
                       labelText: '파일 이름', prefixIcon: Icon(Icons.edit_outlined)),
                 ),
                 const SizedBox(height: 22),
-                const _Label('형식'),
-                Row(children: [
+                const _Label('형식 (여러 개 선택 가능)'),
+                Wrap(spacing: 8, runSpacing: 8, children: [
                   for (final f in SaveFormat.values)
-                    Expanded(
+                    SizedBox(
+                      width: (MediaQuery.of(sheet).size.width - 44 - 16) / 3,
                       child: _FormatCard(
                         info: _formatInfo[f]!,
-                        selected: o.format == f,
-                        onTap: () => set(() => o.format = f),
+                        selected: o.formats.contains(f),
+                        // 마지막 하나는 끌 수 없다
+                        onTap: () => set(() {
+                          if (!o.formats.remove(f) || o.formats.isEmpty) o.formats.add(f);
+                        }),
                       ),
                     ),
                 ]),
-                if (o.format != SaveFormat.txt) ...[
+                if (o.formats.any((f) => f != SaveFormat.txt && f != SaveFormat.docx)) ...[
                   const SizedBox(height: 22),
                   const _Label('화질'),
                   SegmentedButton<SaveQuality>(
@@ -128,7 +181,7 @@ Future<(SaveOptions, SaveTarget)?> showSaveSheet(
                     onSelectionChanged: (v) => set(() => o.quality = v.first),
                   ),
                 ],
-                if (o.format == SaveFormat.pdf) ...[
+                if (hasPdf) ...[
                   const SizedBox(height: 12),
                   SwitchListTile(
                     contentPadding: EdgeInsets.zero,
@@ -183,6 +236,15 @@ Future<(SaveOptions, SaveTarget)?> showSaveSheet(
                           labelText: '암호 (영문·숫자·기호)', prefixIcon: Icon(Icons.lock_outline_rounded)),
                     ),
                 ],
+                if (o.formats.length > 1 ||
+                    (count > 1 && (o.formats.contains(SaveFormat.jpg) || o.formats.contains(SaveFormat.png))))
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('ZIP 하나로 묶기'),
+                    subtitle: const Text('파일이 여러 개일 때 한 파일로', style: TextStyle(color: AppColors.muted)),
+                    value: o.zip,
+                    onChanged: (v) => set(() => o.zip = v),
+                  ),
                 if (selected > 0 && selected < total)
                   SwitchListTile(
                     contentPadding: EdgeInsets.zero,
@@ -191,6 +253,12 @@ Future<(SaveOptions, SaveTarget)?> showSaveSheet(
                     onChanged: (v) => set(() => o.onlySelected = v),
                   ),
                 const SizedBox(height: 22),
+                if (o.formats.length > 1 && !imagesOnly && !o.zip)
+                  const Padding(
+                    padding: EdgeInsets.only(bottom: 10),
+                    child: Text('사진은 갤러리에, PDF·TXT는 저장 위치를 물어보고 저장해요',
+                        style: TextStyle(color: AppColors.muted, fontSize: 12)),
+                  ),
                 Row(children: [
                   Expanded(
                     child: OutlinedButton.icon(
@@ -203,9 +271,13 @@ Future<(SaveOptions, SaveTarget)?> showSaveSheet(
                   Expanded(
                     flex: 2,
                     child: FilledButton.icon(
-                      icon: Icon(isImage ? Icons.photo_library_rounded : Icons.download_rounded),
-                      label: Text(isImage ? '갤러리에 저장' : '기기에 저장'),
-                      onPressed: () => go(isImage ? SaveTarget.gallery : SaveTarget.device),
+                      icon: Icon(imagesOnly ? Icons.photo_library_rounded : Icons.download_rounded),
+                      label: Text(o.formats.length > 1
+                          ? '${o.formats.length}개 형식 저장'
+                          : imagesOnly
+                              ? '갤러리에 저장'
+                              : '기기에 저장'),
+                      onPressed: () => go(imagesOnly ? SaveTarget.gallery : SaveTarget.device),
                     ),
                   ),
                 ]),
@@ -245,7 +317,6 @@ class _FormatCard extends StatelessWidget {
       onTap: onTap,
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 180),
-        margin: const EdgeInsets.symmetric(horizontal: 4),
         padding: const EdgeInsets.symmetric(vertical: 14),
         decoration: BoxDecoration(
           color: selected ? AppColors.accent.withValues(alpha: .14) : AppColors.card,
@@ -267,60 +338,125 @@ class _FormatCard extends StatelessWidget {
 // ───────────────────────── 실제 저장 ─────────────────────────
 
 /// 옵션대로 파일을 만들어 저장·공유한다. 사용자에게 보여줄 결과 문장을 돌려준다 (취소면 null).
+/// 형식을 여러 개 고르면 한 번에 모두 만든다.
 Future<String?> runSave(List<ScanPage> pages, SaveOptions o, SaveTarget target) async {
   final (_, maxSide, quality) = _qualityInfo[o.quality]!;
+  final outs = <(String, Uint8List, String)>[]; // 이름, 내용, mime
 
-  switch (o.format) {
-    case SaveFormat.pdf:
-      final bytes = await _buildPdf(pages, o, maxSide, quality);
-      return _deliverOne('${o.name}.pdf', bytes, 'application/pdf', target);
+  for (final f in SaveFormat.values) {
+    if (!o.formats.contains(f)) continue;
+    switch (f) {
+      case SaveFormat.pdf:
+        outs.add(('${o.name}.pdf', await _buildPdf(pages, o, maxSide, quality), 'application/pdf'));
 
-    case SaveFormat.txt:
-      final text = [
-        for (var i = 0; i < pages.length; i++) '── ${i + 1}페이지 ──\n${pages[i].ocr?.text ?? ''}',
-      ].join('\n\n');
-      // BOM을 붙여야 윈도우 메모장에서도 한글이 깨지지 않는다
-      final bytes = Uint8List.fromList([0xEF, 0xBB, 0xBF, ...utf8.encode(text)]);
-      return _deliverOne('${o.name}.txt', bytes, 'text/plain', target);
+      case SaveFormat.txt:
+        final text = [
+          for (var i = 0; i < pages.length; i++) '── ${i + 1}페이지 ──\n${pages[i].ocr?.text ?? ''}',
+        ].join('\n\n');
+        // BOM을 붙여야 윈도우 메모장에서도 한글이 깨지지 않는다
+        outs.add(('${o.name}.txt', Uint8List.fromList([0xEF, 0xBB, 0xBF, ...utf8.encode(text)]), 'text/plain'));
 
-    case SaveFormat.jpg:
-    case SaveFormat.png:
-      final ext = o.format.name;
-      final files = <(String, Uint8List)>[];
-      for (var i = 0; i < pages.length; i++) {
-        final bytes = maxSide == null && ext == 'jpg'
-            ? pages[i].jpg
-            : await compute(transcode, (pages[i].jpg, ext, maxSide, quality));
-        final suffix = pages.length == 1 ? '' : '_${(i + 1).toString().padLeft(3, '0')}';
-        files.add(('${o.name}$suffix.$ext', bytes));
-      }
-      if (target == SaveTarget.share) {
-        final dir = await getTemporaryDirectory();
-        final xs = <XFile>[];
-        for (final (name, bytes) in files) {
-          xs.add(XFile((await File('${dir.path}/$name').writeAsBytes(bytes)).path));
+      case SaveFormat.docx:
+        outs.add((
+          '${o.name}.docx',
+          _buildDocx(pages),
+          'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        ));
+
+      case SaveFormat.longImage:
+        final long = await compute(stitchLong, ([for (final p in pages) p.jpg], quality));
+        outs.add(('${o.name}_long.jpg', long, 'image/jpeg'));
+
+      case SaveFormat.jpg:
+      case SaveFormat.png:
+        final ext = f.name;
+        for (var i = 0; i < pages.length; i++) {
+          final bytes = maxSide == null && ext == 'jpg'
+              ? pages[i].jpg
+              : await compute(transcode, (pages[i].jpg, ext, maxSide, quality));
+          final suffix = pages.length == 1 ? '' : '_${(i + 1).toString().padLeft(3, '0')}';
+          outs.add(('${o.name}$suffix.$ext', bytes, ext == 'jpg' ? 'image/jpeg' : 'image/png'));
         }
-        await SharePlus.instance.share(ShareParams(files: xs));
-        return null;
-      }
-      if (!await Gal.hasAccess(toAlbum: true)) await Gal.requestAccess(toAlbum: true);
-      for (final (name, bytes) in files) {
-        await Gal.putImageBytes(bytes, album: 'BookScan', name: name.split('.').first);
-      }
-      return '사진 ${files.length}장을 갤러리 BookScan 앨범에 저장했습니다';
+    }
   }
-}
 
-Future<String?> _deliverOne(String name, Uint8List bytes, String mime, SaveTarget target) async {
+  if (o.zip && outs.length > 1) {
+    final zip = Archive();
+    for (final (name, bytes, _) in outs) {
+      zip.addFile(ArchiveFile.bytes(name, bytes));
+    }
+    outs
+      ..clear()
+      ..add(('${o.name}.zip', Uint8List.fromList(ZipEncoder().encode(zip)), 'application/zip'));
+  }
+
   if (target == SaveTarget.share) {
     final dir = await getTemporaryDirectory();
-    final f = await File('${dir.path}/$name').writeAsBytes(bytes);
-    await SharePlus.instance.share(ShareParams(files: [XFile(f.path, mimeType: mime)]));
+    final xs = <XFile>[];
+    for (final (name, bytes, mime) in outs) {
+      xs.add(XFile((await File('${dir.path}/$name').writeAsBytes(bytes)).path, mimeType: mime));
+    }
+    await SharePlus.instance.share(ShareParams(files: xs));
     return null;
   }
-  // 저장 위치와 이름을 사용자가 고르는 시스템 저장 창
-  final uri = await FilePicker.saveFile(fileName: name, bytes: bytes, mimeType: mime);
-  return uri == null ? null : '$name 저장 완료';
+
+  // 기기 저장: 사진은 갤러리로, PDF·TXT는 저장 위치를 고르는 시스템 저장 창으로
+  final bothImages = o.formats.contains(SaveFormat.jpg) && o.formats.contains(SaveFormat.png);
+  var photos = 0;
+  final docs = <String>[];
+  for (final (name, bytes, mime) in outs) {
+    if (mime.startsWith('image/')) {
+      if (photos == 0 && !await Gal.hasAccess(toAlbum: true)) await Gal.requestAccess(toAlbum: true);
+      // JPG·PNG를 같이 저장하면 이름이 겹치지 않게 확장자를 이름에 남긴다
+      final gname = bothImages ? name.replaceAll('.', '_') : name.split('.').first;
+      await Gal.putImageBytes(bytes, album: 'BookScan', name: gname);
+      photos++;
+    } else {
+      final uri = await FilePicker.saveFile(fileName: name, bytes: bytes, mimeType: mime);
+      if (uri != null) docs.add(name);
+    }
+  }
+  final parts = [
+    if (docs.isNotEmpty) docs.join(', '),
+    if (photos > 0) '사진 $photos장(갤러리 BookScan 앨범)',
+  ];
+  return parts.isEmpty ? null : '${parts.join(' + ')} 저장 완료';
+}
+
+String _xml(String t) =>
+    t.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+
+/// OCR 글자를 페이지별로 담은 워드 문서(.docx). 페이지 사이에 쪽 나누기가 들어간다.
+Uint8List _buildDocx(List<ScanPage> pages) {
+  final body = StringBuffer();
+  for (var i = 0; i < pages.length; i++) {
+    if (i > 0) body.write('<w:p><w:r><w:br w:type="page"/></w:r></w:p>');
+    for (final line in (pages[i].ocr?.text ?? '').split('\n')) {
+      body.write('<w:p><w:r><w:t xml:space="preserve">${_xml(line)}</w:t></w:r></w:p>');
+    }
+  }
+  const ns = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+  Uint8List u(String s) => Uint8List.fromList(utf8.encode(s));
+  final z = Archive()
+    ..addFile(ArchiveFile.bytes(
+        '[Content_Types].xml',
+        u('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+            '</Types>')))
+    ..addFile(ArchiveFile.bytes(
+        '_rels/.rels',
+        u('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+            '</Relationships>')))
+    ..addFile(ArchiveFile.bytes(
+        'word/document.xml',
+        u('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<w:document xmlns:w="$ns"><w:body>$body<w:sectPr/></w:body></w:document>')));
+  return Uint8List.fromList(ZipEncoder().encode(z));
 }
 
 /// 검색 가능한 PDF: 페이지 사진 위에 OCR 글자를 보이지 않게 겹쳐 넣는다.
@@ -407,49 +543,66 @@ Future<Uint8List> _buildPdf(List<ScanPage> pages, SaveOptions o, int? maxSide, i
   return doc.save();
 }
 
-/// 공유하기: 형식만 고르면 바로 안드로이드 공유 창(카카오톡·메일 등)이 열린다.
+/// 공유하기: 형식을 (여러 개) 고르고 누르면 안드로이드 공유 창(카카오톡·메일 등)이 열린다.
 Future<void> shareDocument(BuildContext context, List<ScanPage> pages, String docName) async {
-  final format = await showModalBottomSheet<SaveFormat>(
+  final picked = <SaveFormat>{SaveFormat.pdf};
+  final formats = await showModalBottomSheet<Set<SaveFormat>>(
     context: context,
     backgroundColor: AppColors.surface,
     shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(24))),
-    builder: (s) => SafeArea(
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(20, 18, 20, 12),
-        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text('공유하기', style: Theme.of(s).textTheme.titleLarge),
-          const SizedBox(height: 4),
-          Text('${pages.length}페이지 · 다음 화면에서 카카오톡·메일 등 보낼 앱을 고르세요',
-              style: const TextStyle(color: AppColors.muted)),
-          const SizedBox(height: 16),
-          for (final (f, icon, title, sub) in [
-            (SaveFormat.pdf, Icons.picture_as_pdf_rounded, 'PDF 한 개로', '글자 검색 가능'),
-            (SaveFormat.jpg, Icons.image_rounded, '사진(JPG)으로', '페이지마다 한 장'),
-            (SaveFormat.txt, Icons.notes_rounded, '글자(TXT)로', '인식된 글자만'),
-          ])
-            Padding(
-              padding: const EdgeInsets.only(bottom: 10),
-              child: Material(
-                color: AppColors.card,
-                borderRadius: BorderRadius.circular(16),
-                child: ListTile(
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-                  leading: Icon(icon, color: AppColors.accent),
-                  title: Text(title, style: const TextStyle(fontWeight: FontWeight.w700)),
-                  subtitle: Text(sub, style: const TextStyle(color: AppColors.muted)),
-                  trailing: const Icon(Icons.ios_share_rounded),
-                  onTap: () => Navigator.pop(s, f),
+    builder: (s) => StatefulBuilder(
+      builder: (s, set) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 18, 20, 12),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('공유하기', style: Theme.of(s).textTheme.titleLarge),
+            const SizedBox(height: 4),
+            Text('${pages.length}페이지 · 여러 형식을 함께 보낼 수 있어요',
+                style: const TextStyle(color: AppColors.muted)),
+            const SizedBox(height: 16),
+            for (final (f, icon, title, sub) in [
+              (SaveFormat.pdf, Icons.picture_as_pdf_rounded, 'PDF 한 개로', '글자 검색 가능'),
+              (SaveFormat.jpg, Icons.image_rounded, '사진(JPG)으로', '페이지마다 한 장'),
+              (SaveFormat.png, Icons.photo_rounded, '사진(PNG)으로', '무손실, 용량 큼'),
+              (SaveFormat.txt, Icons.notes_rounded, '글자(TXT)로', '인식된 글자만'),
+              (SaveFormat.docx, Icons.description_rounded, '워드(DOCX)로', '인식된 글자를 편집'),
+              (SaveFormat.longImage, Icons.view_day_rounded, '긴 사진 한 장으로', '페이지를 위아래로 이어붙임'),
+            ])
+              Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: Material(
+                  color: AppColors.card,
+                  borderRadius: BorderRadius.circular(16),
+                  child: CheckboxListTile(
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                    secondary: Icon(icon, color: AppColors.accent),
+                    title: Text(title, style: const TextStyle(fontWeight: FontWeight.w700)),
+                    subtitle: Text(sub, style: const TextStyle(color: AppColors.muted)),
+                    value: picked.contains(f),
+                    onChanged: (v) => set(() {
+                      v == true ? picked.add(f) : picked.remove(f);
+                    }),
+                  ),
                 ),
               ),
+            const SizedBox(height: 4),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                icon: const Icon(Icons.ios_share_rounded),
+                label: Text('${picked.length}개 형식 공유'),
+                onPressed: picked.isEmpty ? null : () => Navigator.pop(s, picked),
+              ),
             ),
-        ]),
+          ]),
+        ),
       ),
     ),
   );
-  if (format == null) return;
+  if (formats == null || formats.isEmpty) return;
   final o = SaveOptions()
     ..name = docName.replaceAll(RegExp(r'[\/:*?"<>|]'), '-').replaceAll(' ', '_')
-    ..format = format
+    ..formats = formats
     ..quality = SaveQuality.standard;
   await runSave(pages, o, SaveTarget.share);
 }

@@ -1340,6 +1340,8 @@ Future<Uint8List> stampPage((Uint8List, List<(Uint8List, double, double, double,
 /// isolate에서 실행된다: 자동 정리 — 손가락 지우기, 그림자·빛 반사 고르게.
 Future<Uint8List> cleanPage(Uint8List flat) async {
   var img = cv.imdecode(flat, cv.IMREAD_COLOR);
+  // 0) 빛 반사: 번쩍이는 하이라이트는 주변 종이로 먼저 메운다 (바탕 추정이 흔들리지 않게)
+  img = _inpaintGlare(img).$1;
   final w = img.cols, h = img.rows, n = w * h;
 
   // 종이 바탕 추정: 글씨(어두운 점)를 지우고 크게 흐림 → 그 자리의 종이 색
@@ -1385,7 +1387,7 @@ Future<Uint8List> cleanPage(Uint8List flat) async {
     img = cv.Mat.fromList(h, w, cv.MatType.CV_8UC3, id);
   }
 
-  // 2) 그림자·빛 반사: 채널마다 종이 바탕으로 나눠 밝기를 고르게 (색은 유지)
+  // 2) 그림자: 채널마다 종이 바탕으로 나눠 밝기를 고르게 (색은 유지)
   final ch = cv.split(img), bch = cv.split(bg);
   final flatCh = [for (var c = 0; c < 3; c++) cv.divide(ch[c], bch[c], scale: 240)];
   final even = cv.merge(cv.VecMat.fromList(flatCh));
@@ -1437,4 +1439,193 @@ Future<(List<Offset>?, Uint8List)> liveDetect((Uint8List, int, int, int, int) ar
       2;
   if (qa < hullA * 0.8) return (null, sig);
   return ([for (final p in q) Offset(p.dx / gw, p.dy / gh)], sig);
+}
+
+// ───────────────────────── 화질 개선: 빛 반사·기울기·선명도·긴 이미지 ─────────────────────────
+
+/// 빛 반사(번쩍이는 하이라이트)를 찾아 주변 종이로 메운다. (결과, 반사가 차지한 비율 0~1)
+(cv.Mat, double) _inpaintGlare(cv.Mat img) {
+  final w = img.cols, h = img.rows;
+  final s = math.min(1.0, 1000 / math.max(w, h));
+  final small = s < 1
+      ? cv.resize(img, ((w * s).round(), (h * s).round()), interpolation: cv.INTER_AREA)
+      : img;
+  final sw = small.cols, sh = small.rows, sn = sw * sh;
+  final gray = cv.cvtColor(small, cv.COLOR_BGR2GRAY);
+  final gd = gray.data;
+
+  // 종이 밝기: 전체의 60번째 백분위. 이보다 확 밝고 거의 하얀 곳을 반사로 본다
+  final hist = List<int>.filled(256, 0);
+  for (var i = 0; i < sn; i++) {
+    hist[gd[i]]++;
+  }
+  var acc = 0, paper = 200;
+  for (var v = 0; v < 256; v++) {
+    acc += hist[v];
+    if (acc >= sn * 0.6) {
+      paper = v;
+      break;
+    }
+  }
+  final thr = math.max(paper + 28, 232);
+  if (thr >= 255) return (img, 0); // 종이 자체가 이미 하얗다: 구분할 수 없다
+
+  // 색이 거의 없는(하얀) 곳만: 색 있는 밝은 그림은 지우지 않는다
+  final hsv = cv.cvtColor(small, cv.COLOR_BGR2HSV).data;
+  final m = Uint8List(sn);
+  for (var i = 0; i < sn; i++) {
+    if (gd[i] >= thr && hsv[i * 3 + 1] < 60) m[i] = 255;
+  }
+  var mask = cv.Mat.fromList(sh, sw, cv.MatType.CV_8UC1, m);
+  mask = cv.morphologyEx(mask, cv.MORPH_OPEN, cv.getStructuringElement(cv.MORPH_ELLIPSE, (5, 5)));
+
+  // 작은 점(잡티)은 반사가 아니다
+  final labels = cv.Mat.empty(), stats = cv.Mat.empty(), cents = cv.Mat.empty();
+  final cnt = cv.connectedComponentsWithStats(mask, labels, stats, cents, 8, cv.MatType.CV_32S, -1);
+  final keep = List<bool>.filled(cnt, false);
+  var any = false;
+  for (var i = 1; i < cnt; i++) {
+    final area = stats.at<int>(i, 4);
+    // 너무 작은 것(잡티)과 페이지 절반 넘게 차지하는 것(그냥 하얀 종이)은 제외
+    if (area > sn * 0.0006 && area < sn * 0.5) {
+      keep[i] = true;
+      any = true;
+    }
+  }
+  if (!any) return (img, 0);
+
+  final lab = Uint8List.fromList(labels.data).buffer.asInt32List();
+  final mm = Uint8List(sn);
+  var covered = 0;
+  for (var i = 0; i < sn; i++) {
+    if (keep[lab[i]]) {
+      mm[i] = 255;
+      covered++;
+    }
+  }
+  final glare = cv.dilate(cv.Mat.fromList(sh, sw, cv.MatType.CV_8UC1, mm),
+      cv.getStructuringElement(cv.MORPH_ELLIPSE, (13, 13)));
+
+  // 반사 자리를 주변 종이 색으로 메운다: 반사가 아닌 곳의 색만 넓게 번지게 한 값 (정규화 흐림).
+  // (OpenCV photo 모듈의 inpaint는 이 앱에 포함돼 있지 않다)
+  final validF = cv.bitwiseNOT(glare).convertTo(cv.MatType.CV_32FC1, alpha: 1 / 255);
+  final k = math.max(31, (math.min(sw, sh) / 5).round() | 1);
+  const eps = 0.02; // 주변에 쓸 색이 거의 없으면 페이지 전체 종이색 쪽으로
+  final paperC = small.mean(mask: cv.bitwiseNOT(glare));
+  final paperV = [paperC.val1, paperC.val2, paperC.val3];
+  final den = cv.addWeighted(cv.blur(validF, (k, k)), 1, validF, 0, eps);
+  final chs = cv.split(small);
+  final fillCh = <cv.Mat>[];
+  for (var c = 0; c < 3; c++) {
+    final num = cv.blur(cv.multiply(chs[c].convertTo(cv.MatType.CV_32FC1), validF), (k, k));
+    fillCh.add(cv.divide(cv.addWeighted(num, 1, num, 0, paperV[c] * eps), den).convertTo(cv.MatType.CV_8UC1));
+  }
+  final filled = cv.merge(cv.VecMat.fromList(fillCh));
+
+  // 원래 크기로 키워 반사 자리에만 덮어쓴다. 글씨(주변 종이보다 훨씬 어두운 점)는 그대로 둔다.
+  final up = s < 1 ? cv.resize(filled, (w, h), interpolation: cv.INTER_CUBIC) : filled;
+  final um = s < 1 ? cv.resize(glare, (w, h), interpolation: cv.INTER_NEAREST) : glare;
+  final id = Uint8List.fromList(img.data), ud = up.data, md = um.data;
+  for (var i = 0; i < w * h; i++) {
+    if (md[i] == 0) continue;
+    final o = id[i * 3] + id[i * 3 + 1] + id[i * 3 + 2], f = ud[i * 3] + ud[i * 3 + 1] + ud[i * 3 + 2];
+    if (o + 75 < f) continue; // 채울 색보다 한참 어두우면 글씨다
+    id[i * 3] = ud[i * 3];
+    id[i * 3 + 1] = ud[i * 3 + 1];
+    id[i * 3 + 2] = ud[i * 3 + 2];
+  }
+  return (cv.Mat.fromList(h, w, cv.MatType.CV_8UC3, id), covered / sn);
+}
+
+/// isolate에서 실행된다: 빛 반사 제거. (결과 JPG, 반사가 차지한 비율 — 0이면 반사를 못 찾은 것)
+Future<(Uint8List, double)> glarePage(Uint8List flat) async {
+  final img = cv.imdecode(flat, cv.IMREAD_COLOR);
+  final (out, ratio) = _inpaintGlare(img);
+  return ratio == 0 ? (flat, 0.0) : (_encode(out), ratio);
+}
+
+/// isolate에서 실행된다: 글줄이 수평이 되도록 미세한 기울기를 바로잡는다.
+/// (결과 JPG, 돌린 각도 — 0이면 손대지 않음)
+Future<(Uint8List, double)> deskewPage(Uint8List flat) async {
+  var img = cv.imdecode(flat, cv.IMREAD_COLOR);
+  final w = img.cols, h = img.rows;
+  final s = math.min(1.0, 700 / math.max(w, h));
+  final small = s < 1 ? cv.resize(img, ((w * s).round(), (h * s).round()), interpolation: cv.INTER_AREA) : img;
+  final gray = cv.gaussianBlur(cv.cvtColor(small, cv.COLOR_BGR2GRAY), (3, 3), 0);
+  var (_, ink) = cv.threshold(gray, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
+  // 글자를 가로로 이어 글줄 덩어리로
+  ink = cv.dilate(ink, cv.getStructuringElement(cv.MORPH_RECT, (15, 1)));
+  final sw = ink.cols, sh = ink.rows;
+  final center = cv.Point2f(sw / 2, sh / 2);
+
+  // 각도에 따라 글줄 덩어리의 가로 합이 얼마나 뚜렷한지 (줄이 수평일수록 커진다)
+  double score(double angle) {
+    final r = cv.warpAffine(ink, cv.getRotationMatrix2D(center, angle, 1), (sw, sh));
+    final d = r.data;
+    var sum = 0.0;
+    for (var y = 0; y < sh; y++) {
+      var row = 0;
+      for (var x = 0; x < sw; x++) {
+        if (d[y * sw + x] > 0) row++;
+      }
+      sum += row.toDouble() * row;
+    }
+    return sum;
+  }
+
+  final base = score(0);
+  if (base == 0) return (flat, 0.0);
+  var best = 0.0, bestScore = base;
+  for (var a = -6.0; a <= 6.0; a += 0.5) {
+    final sc = score(a);
+    if (sc > bestScore) (best, bestScore) = (a, sc);
+  }
+  for (var a = best - 0.4; a <= best + 0.4; a += 0.1) {
+    final sc = score(a);
+    if (sc > bestScore) (best, bestScore) = (a, sc);
+  }
+  // 거의 수평이거나 개선이 뚜렷하지 않으면 그대로 (그림만 있는 페이지 등)
+  if (best.abs() < 0.3 || bestScore < base * 1.03) return (flat, 0.0);
+
+  final m = cv.getRotationMatrix2D(cv.Point2f(w / 2, h / 2), best, 1);
+  img = cv.warpAffine(img, m, (w, h), flags: cv.INTER_CUBIC, borderMode: cv.BORDER_REPLICATE);
+  return (_encode(img), best);
+}
+
+/// isolate에서 실행된다: 초점이 맞았는지 (라플라시안 분산, 클수록 선명). 글씨가 거의 없는 빈 페이지면 -1.
+Future<double> sharpness(Uint8List jpg) async {
+  var g = cv.imdecode(jpg, cv.IMREAD_GRAYSCALE);
+  final s = 800 / math.max(g.cols, g.rows);
+  if (s < 1) g = cv.resize(g, ((g.cols * s).round(), (g.rows * s).round()), interpolation: cv.INTER_AREA);
+  final (mean, std) = cv.meanStdDev(g);
+  if (std.val1 < 20 || mean.val1 < 1) return -1; // 빈 페이지
+  final lap = cv.laplacian(g, cv.MatType.CV_64F);
+  final (_, sd) = cv.meanStdDev(lap);
+  return sd.val1 * sd.val1;
+}
+
+/// isolate에서 실행된다: 페이지 사진들을 세로로 이어 붙여 긴 사진 한 장으로. (JPG 목록, JPG 화질)
+Future<Uint8List> stitchLong((List<Uint8List>, int) args) async {
+  final (jpgs, quality) = args;
+  // 가로 폭을 맞춘다. 사진이 너무 길어지지 않게 (JPG 한계 65535px) 전체 높이를 3만 픽셀 안으로
+  final ratios = <double>[
+    for (final j in jpgs)
+      () {
+        final r = cv.imdecode(j, cv.IMREAD_REDUCED_COLOR_8);
+        return r.rows / r.cols;
+      }(),
+  ];
+  final sum = ratios.fold<double>(0, (a, b) => a + b);
+  final width = math.max(200, math.min(1200, (30000 / sum).floor()));
+  final heights = [for (final r in ratios) math.max(1, (width * r).round())];
+  final buf = Uint8List(heights.fold<int>(0, (a, b) => a + b) * width * 3);
+  var off = 0;
+  for (var i = 0; i < jpgs.length; i++) {
+    final m = cv.resize(cv.imdecode(jpgs[i], cv.IMREAD_COLOR), (width, heights[i]), interpolation: cv.INTER_AREA);
+    final d = m.data;
+    buf.setRange(off, off + d.length, d);
+    off += d.length;
+  }
+  final out = cv.Mat.fromList(heights.fold<int>(0, (a, b) => a + b), width, cv.MatType.CV_8UC3, buf);
+  return cv.imencode('.jpg', out, params: cv.VecI32.fromList([cv.IMWRITE_JPEG_QUALITY, quality])).$2;
 }

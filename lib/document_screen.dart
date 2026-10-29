@@ -156,7 +156,9 @@ class _DocumentScreenState extends State<DocumentScreen> {
     setState(() => _busy = true);
     try {
       // 글자 검색 PDF나 TXT는 OCR이 끝나야 한다
-      final needOcr = o.format == SaveFormat.txt || (o.format == SaveFormat.pdf && o.searchable);
+      final needOcr = o.formats.contains(SaveFormat.txt) ||
+          o.formats.contains(SaveFormat.docx) ||
+          (o.formats.contains(SaveFormat.pdf) && o.searchable);
       if (needOcr && targets.any((p) => p.ocr == null)) {
         setState(() => _busyText = '글자 인식 마무리 중…');
         _runOcr();
