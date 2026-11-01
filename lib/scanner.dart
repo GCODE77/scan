@@ -12,13 +12,33 @@ const kPts = 7;
 const kMid = kPts ~/ 2;
 
 class PageShape {
-  PageShape(this.top, this.bottom, this.spread);
+  PageShape(this.top, this.bottom, this.spread, {this.leftBow = Offset.zero, this.rightBow = Offset.zero});
 
   final List<Offset> top;
   final List<Offset> bottom;
   final bool spread;
 
-  PageShape copy({bool? spread}) => PageShape([...top], [...bottom], spread ?? this.spread);
+  /// 왼쪽·오른쪽 변의 가운데가 곧은 선에서 벗어난 정도 (변은 위아래 모서리를 잇는 포물선으로 휜다)
+  final Offset leftBow;
+  final Offset rightBow;
+
+  PageShape copy({bool? spread}) =>
+      PageShape([...top], [...bottom], spread ?? this.spread, leftBow: leftBow, rightBow: rightBow);
+
+  /// 휜 왼쪽/오른쪽 변 위의 점들 (위 모서리 → 아래 모서리)
+  List<Offset> sideCurve({required bool left, int n = 24}) {
+    final a = left ? top.first : top.last, b = left ? bottom.first : bottom.last;
+    final bow = left ? leftBow : rightBow;
+    return [
+      for (var i = 0; i <= n; i++) Offset.lerp(a, b, i / n)! + bow * (4 * (i / n) * (1 - i / n)),
+    ];
+  }
+
+  /// 네 변을 따라 닫힌 윤곽선 (위 → 오른쪽 → 아래 → 왼쪽)
+  List<Offset> outline() {
+    final r = sideCurve(left: false), l = sideCurve(left: true);
+    return [...sampleCurve(top), ...r.skip(1), ...sampleCurve(bottom).reversed, ...l.reversed.skip(1)];
+  }
 
   /// 네 모서리만으로 만든 곧은 사각형
   factory PageShape.quad(List<Offset> c, bool spread) => PageShape(
@@ -936,7 +956,8 @@ List<double> _cumLength(List<Offset> pts) {
 }
 
 /// 휘어진 위·아래 가장자리 사이를 격자로 나눠 평평한 직사각형으로 편다.
-cv.Mat _dewarp(cv.Mat img, List<Offset> top, List<Offset> bottom) {
+cv.Mat _dewarp(cv.Mat img, List<Offset> top, List<Offset> bottom,
+    [Offset bowL = Offset.zero, Offset bowR = Offset.zero]) {
   final cumT = _cumLength(top), cumB = _cumLength(bottom);
   final outW = ((cumT.last + cumB.last) / 2).round();
   final outH = (((bottom.first - top.first).distance +
@@ -952,9 +973,10 @@ cv.Mat _dewarp(cv.Mat img, List<Offset> top, List<Offset> bottom) {
   for (var gx = 0; gx < gw; gx++) {
     final u = math.min(gx * step / (outW - 1), 1.0);
     final t = _atLength(top, cumT, u), b = _atLength(bottom, cumB, u);
+    final bow = bowL * (1 - u) + bowR * u; // 좌우 변이 휜 만큼 안쪽 격자도 같이 휜다
     for (var gy = 0; gy < gh; gy++) {
       final v = math.min(gy * step / (outH - 1), 1.0);
-      final p = Offset.lerp(t, b, v)!;
+      final p = Offset.lerp(t, b, v)! + bow * (4 * v * (1 - v));
       mx[gy * gw + gx] = p.dx;
       my[gy * gw + gx] = p.dy;
     }
@@ -1050,14 +1072,15 @@ Future<List<Uint8List>> warpFlat((Uint8List, PageShape) args) async {
   final img = cv.imdecode(jpg, cv.IMREAD_COLOR);
   final top = sampleCurve(shape.top), bottom = sampleCurve(shape.bottom);
 
+  // 양면이면 제본선 쪽 변은 휘지 않는다
   final parts = shape.spread
       ? [
-          (top.sublist(0, kMid * _segSamples + 1), bottom.sublist(0, kMid * _segSamples + 1)),
-          (top.sublist(kMid * _segSamples), bottom.sublist(kMid * _segSamples)),
+          (top.sublist(0, kMid * _segSamples + 1), bottom.sublist(0, kMid * _segSamples + 1), shape.leftBow, Offset.zero),
+          (top.sublist(kMid * _segSamples), bottom.sublist(kMid * _segSamples), Offset.zero, shape.rightBow),
         ]
-      : [(top, bottom)];
+      : [(top, bottom, shape.leftBow, shape.rightBow)];
 
-  return [for (final (t, b) in parts) _encode(_dewarp(img, t, b))];
+  return [for (final (t, b, bl, br) in parts) _encode(_dewarp(img, t, b, bl, br))];
 }
 
 /// isolate에서 실행된다: 편 이미지에 필터·회전 적용. maxSide를 주면 미리보기용으로 작게.
@@ -1202,12 +1225,17 @@ Offset? _snapL(_Grad g, List<Offset> q, int idx) {
   return best;
 }
 
-/// [byColor]: 종이 자체의 색 기준 (흰색·색 종이 모두). 아니면 '흰 종이' 기준.
-Offset? _snapBy(_Grad g, List<Offset> q, int idx, {required bool byColor}) {
-  final c = q[idx];
-  final center = q.reduce((a, b) => a + b) / 4;
-  final diag = ((q[2] - q[0]).distance + (q[3] - q[1]).distance) / 2;
+/// 종이 판정 기준: 값이 '종이다울수록 크게' 나오는 함수와 문턱.
+class _PaperModel {
+  _PaperModel(this.paperness, this.inT, this.gap, this.minDiff);
 
+  final double Function(Offset) paperness;
+  final double inT, gap, minDiff;
+}
+
+/// 사각형 [q] 안쪽 표본으로 종이의 색(또는 흰색)을 알아내 '종이다움' 판정 기준을 만든다.
+_PaperModel? _paperModel(_Grad g, List<Offset> q, {required bool byColor}) {
+  final center = q.reduce((a, b) => a + b) / 4;
   // 사각형 안쪽(가운데 60%)에서 표본
   final inner = <Offset>[];
   for (var i = 0; i <= 20; i++) {
@@ -1217,9 +1245,6 @@ Offset? _snapBy(_Grad g, List<Offset> q, int idx, {required bool byColor}) {
     }
   }
 
-  // 판정 기준: 값이 '종이다울수록 크게' 나오는 함수와 문턱
-  late final double Function(Offset) paperness;
-  late final double inT, gap, minDiff;
   if (byColor) {
     // 종이 색 = 안쪽에서 밝은 쪽 절반의 중앙값 (글씨 제외)
     final px = <List<double>>[];
@@ -1241,17 +1266,23 @@ Offset? _snapBy(_Grad g, List<Offset> q, int idx, {required bool byColor}) {
       ..sort();
     final dlim = math.max(12.0, d[(d.length * 0.75).floor()] * 1.3);
     // 거리 → '종이다움' (작을수록 종이)
-    paperness = (p) => -g.distAt(p, pc);
-    inT = -dlim;
-    gap = 15;
-    minDiff = 20;
+    return _PaperModel((p) => -g.distAt(p, pc), -dlim, 15, 20);
   } else {
     final w = inner.map(g.whiteAt).toList()..sort();
-    paperness = g.whiteAt;
-    inT = 0.8 * w[(w.length * 0.75).floor()];
-    gap = 25;
-    minDiff = 35;
+    return _PaperModel(g.whiteAt, 0.8 * w[(w.length * 0.75).floor()], 25, 35);
   }
+}
+
+/// [byColor]: 종이 자체의 색 기준 (흰색·색 종이 모두). 아니면 '흰 종이' 기준.
+Offset? _snapBy(_Grad g, List<Offset> q, int idx, {required bool byColor}) {
+  final c = q[idx];
+  final center = q.reduce((a, b) => a + b) / 4;
+  final diag = ((q[2] - q[0]).distance + (q[3] - q[1]).distance) / 2;
+
+  final model = _paperModel(g, q, byColor: byColor);
+  if (model == null) return null;
+  final paperness = model.paperness;
+  final inT = model.inT, gap = model.gap, minDiff = model.minDiff;
 
   // 이 모서리에서 이웃 모서리까지 변 전체를 보며 실제 테두리를 찾아 직선으로
   (Offset, Offset)? edgeNear(Offset other) {
@@ -1628,4 +1659,78 @@ Future<Uint8List> stitchLong((List<Uint8List>, int) args) async {
   }
   final out = cv.Mat.fromList(heights.fold<int>(0, (a, b) => a + b), width, cv.MatType.CV_8UC3, buf);
   return cv.imencode('.jpg', out, params: cv.VecI32.fromList([cv.IMWRITE_JPEG_QUALITY, quality])).$2;
+}
+
+/// isolate에서 실행된다: 변 위의 점들을 가까운 실제 종이 경계에 붙인다 (포토샵 자석 올가미처럼).
+/// (원본 JPG, 네 모서리 [좌상·우상·우하·좌하], 변 번호 [0=위 1=오른쪽 2=아래 3=왼쪽], 변 위의 점들)
+/// → 붙은 점들. 확실하지 않은 점은 그대로 둔다.
+Future<List<Offset>> snapEdgePoints((Uint8List, List<Offset>, int, List<Offset>) args) async {
+  final (jpg, quad, edge, pts) = args;
+  if (pts.isEmpty) return pts;
+  final img = cv.imdecode(jpg, cv.IMREAD_COLOR);
+  if (img.isEmpty) return pts;
+  final g = _Grad(img, 1.0);
+  final q = [for (final p in quad) p * g.s];
+  final center = q.reduce((a, b) => a + b) / 4;
+  final diag = ((q[2] - q[0]).distance + (q[3] - q[1]).distance) / 2;
+  final a = q[edge], b = q[(edge + 1) % 4];
+  final d = b - a, len = d.distance;
+  if (len < 10) return pts;
+  // 바깥쪽(종이에서 멀어지는 쪽)을 가리키는 법선
+  var n = Offset(-d.dy, d.dx) / len;
+  if ((center - (a + b) / 2).dx * n.dx + (center - (a + b) / 2).dy * n.dy > 0) n = -n;
+  final band = math.max(10, (diag * 0.07).round()); // 이 범위 안의 경계만 붙는다
+
+  double mean(List<double> v, int from, int to) {
+    var sum = 0.0;
+    for (var i = from; i < to; i++) {
+      sum += v[i];
+    }
+    return sum / (to - from);
+  }
+
+  // 색 기준을 먼저, 안 되면 흰 종이 기준으로
+  for (final byColor in [true, false]) {
+    final m = _paperModel(g, q, byColor: byColor);
+    if (m == null) continue;
+    final offs = <double?>[];
+    for (final p0 in pts) {
+      final p = p0 * g.s;
+      // 바깥(+)으로 갈수록 종이가 아니게 되는 경계 중, 대비가 크고 가까운 것
+      final prof = [for (var j = -band - 8; j <= band + 8; j++) m.paperness(p + n * j.toDouble())];
+      double? best;
+      var bestScore = double.negativeInfinity;
+      for (var i = 8; i < prof.length - 8; i++) {
+        final inside = mean(prof, i - 7, i - 2), outside = mean(prof, i + 2, i + 7);
+        if (inside > m.inT && outside < m.inT - m.gap && inside - outside > m.minDiff) {
+          final off = (i - band - 8).toDouble();
+          final score = (inside - outside) - 0.5 * off.abs();
+          if (score > bestScore) {
+            bestScore = score;
+            best = off;
+          }
+        }
+      }
+      offs.add(best);
+    }
+    final found = [for (final o in offs) ?o];
+    if (found.length < pts.length * 0.6) continue;
+    final sorted = [...found]..sort();
+    final med = sorted[sorted.length ~/ 2];
+    // 중앙값에서 크게 벗어난 점은 오검출 (글씨·무늬 경계 등): 중앙값으로 대신
+    var good = 0;
+    final res = <Offset>[];
+    for (var i = 0; i < pts.length; i++) {
+      var o = offs[i];
+      if (o == null || (o - med).abs() > band * 0.5) {
+        o = med;
+      } else {
+        good++;
+      }
+      res.add(pts[i] + n * (o / g.s));
+    }
+    if (good < pts.length * 0.5) continue;
+    return res;
+  }
+  return pts;
 }

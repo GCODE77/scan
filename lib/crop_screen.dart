@@ -21,12 +21,25 @@ class CropScreen extends StatefulWidget {
 class _CropScreenState extends State<CropScreen> {
   late PageShape _shape = (widget.initial ?? widget.detection.shape).copy();
   late final Uint8List _jpg = widget.detection.jpg;
-  int? _dragging; // 0~kPts-1: 위 가장자리, 그 다음: 아래 가장자리
+  int? _dragging; // 0~kPts-1: 위 가장자리, 그 다음: 아래 가장자리, 그 뒤: 왼쪽·오른쪽 변 가운데
 
-  Offset _point(int i) => i < kPts ? _shape.top[i] : _shape.bottom[i - kPts];
+  /// 왼쪽·오른쪽 변 가운데 손잡이 번호
+  static const _leftMid = 2 * kPts, _rightMid = 2 * kPts + 1;
 
-  /// 손으로 잡을 수 있는 점: 모서리 4개 + 위·아래 가운데 2개 (나머지 점은 자동으로 따라온다)
-  static const _visible = {0, kMid, kPts - 1, kPts, kPts + kMid, 2 * kPts - 1};
+  Offset _sideMid(bool left) => Offset.lerp(
+          left ? _shape.top.first : _shape.top.last, left ? _shape.bottom.first : _shape.bottom.last, 0.5)! +
+      (left ? _shape.leftBow : _shape.rightBow);
+
+  Offset _point(int i) => i == _leftMid
+      ? _sideMid(true)
+      : i == _rightMid
+          ? _sideMid(false)
+          : i < kPts
+              ? _shape.top[i]
+              : _shape.bottom[i - kPts];
+
+  /// 손으로 잡을 수 있는 점: 모서리 4개 + 위·아래·왼쪽·오른쪽 변 가운데 4개 (나머지 점은 자동으로 따라온다)
+  static const _visible = {0, kMid, kPts - 1, kPts, kPts + kMid, 2 * kPts - 1, _leftMid, _rightMid};
 
   /// 모서리 손잡이 번호 → 모서리 번호 (좌상 0, 우상 1, 우하 2, 좌하 3)
   static const _cornerOf = {0: 0, kPts - 1: 1, 2 * kPts - 1: 2, kPts: 3};
@@ -34,6 +47,7 @@ class _CropScreenState extends State<CropScreen> {
   /// 막 붙은 모서리 (잠깐 빛나는 표시)
   int? _snapped;
   int _snapSeq = 0;
+  int _glowSeq = 0;
 
   /// 자석 켜기/끄기 (앱을 켜 있는 동안 기억)
   static bool _magnetOn = true;
@@ -58,12 +72,90 @@ class _CropScreenState extends State<CropScreen> {
     // 일부러 옮겼는데 원래 자리 쪽으로 되돌아가는 것이면 붙이지 않는다
     if (from != null && (p - from).distance < (drop - from).distance * 0.6) return;
     HapticFeedback.selectionClick();
+    final glow = ++_glowSeq;
     setState(() {
       _setPoint(handle, p);
       _snapped = handle;
     });
-    await Future.delayed(const Duration(milliseconds: 700));
-    if (mounted && seq == _snapSeq) setState(() => _snapped = null);
+    // 빛나는 표시는 잠깐 뒤 끈다 (변 자석을 기다리게 하지 않는다)
+    Future.delayed(const Duration(milliseconds: 700), () {
+      if (mounted && glow == _glowSeq) setState(() => _snapped = null);
+    });
+  }
+
+  /// 손잡이를 놓은 뒤 자석: 모서리는 종이 모서리에, 변은 종이 경계를 따라 붙는다.
+  Future<void> _afterDrop(int handle) async {
+    if (!_magnetOn) return;
+    await _snap(handle);
+    final corner = _cornerOf[handle];
+    if (corner != null) {
+      // 모서리를 옮기면 그 모서리에 닿은 두 변이 종이 테두리를 따라가게
+      await _snapEdges({(corner + 3) % 4, corner});
+    } else if (handle == _leftMid) {
+      await _snapEdges({3});
+    } else if (handle == _rightMid) {
+      await _snapEdges({1});
+    } else if (!_shape.spread) {
+      // 양면일 때 위·아래 가운데 점은 제본선이라 변 자석을 쓰지 않는다
+      if (handle == kMid) await _snapEdges({0});
+      if (handle == kPts + kMid) await _snapEdges({2});
+    }
+  }
+
+  /// 변 번호(0=위 1=오른쪽 2=아래 3=왼쪽)들을 가까운 실제 종이 경계에 붙인다. 확실하지 않으면 그대로 둔다.
+  Future<void> _snapEdges(Set<int> edges) async {
+    if (!_magnetOn) return;
+    final seq = ++_snapSeq;
+    final quad = [_shape.top.first, _shape.top.last, _shape.bottom.last, _shape.bottom.first];
+    // 변 위의 점들: 위·아래는 조절점(모서리·제본선 제외), 좌우는 곡선 위 세 지점
+    List<Offset> pointsOf(int e) {
+      switch (e) {
+        case 0:
+          return [for (var k = 1; k < kPts - 1; k++) if (!(_shape.spread && k == kMid)) _shape.top[k]];
+        case 2:
+          return [for (var k = 1; k < kPts - 1; k++) if (!(_shape.spread && k == kMid)) _shape.bottom[k]];
+        default:
+          final side = _shape.sideCurve(left: e == 3, n: 4);
+          return [side[1], side[2], side[3]];
+      }
+    }
+
+    final results = await Future.wait([
+      for (final e in edges) compute(snapEdgePoints, (_jpg, quad, e, pointsOf(e))),
+    ]);
+    if (!mounted || seq != _snapSeq || _dragging != null) return;
+    setState(() {
+      var i = 0;
+      for (final e in edges) {
+        final r = results[i++];
+        switch (e) {
+          case 0:
+            var j = 0;
+            for (var k = 1; k < kPts - 1; k++) {
+              if (_shape.spread && k == kMid) continue;
+              _shape.top[k] = r[j++];
+            }
+          case 2:
+            var j = 0;
+            for (var k = 1; k < kPts - 1; k++) {
+              if (_shape.spread && k == kMid) continue;
+              _shape.bottom[k] = r[j++];
+            }
+          default:
+            // 붙은 세 점으로 휨(가운데가 곧은 선에서 벗어난 정도)을 다시 구한다
+            final left = e == 3;
+            final a = left ? _shape.top.first : _shape.top.last, b = left ? _shape.bottom.first : _shape.bottom.last;
+            var sum = Offset.zero;
+            for (var k = 0; k < 3; k++) {
+              final v = (k + 1) / 4;
+              sum += (r[k] - Offset.lerp(a, b, v)!) / (4 * v * (1 - v));
+            }
+            final bow = sum / 3;
+            _shape = PageShape(_shape.top, _shape.bottom, _shape.spread,
+                leftBow: left ? bow : _shape.leftBow, rightBow: left ? _shape.rightBow : bow);
+        }
+      }
+    });
   }
 
   /// 네 모서리를 한꺼번에 종이 모서리에 붙인다 (자동 인식 버튼)
@@ -79,12 +171,22 @@ class _CropScreenState extends State<CropScreen> {
         _setPoint(handleOf[e.key]!, e.value);
       }
     });
+    await _snapEdges({0, 1, 2, 3});
   }
 
   /// 점 하나를 옮기면 그 변 전체를 자연스럽게 다시 그린다.
   /// - 모서리·제본선: 변의 굴곡 모양은 유지한 채 따라 움직임
   /// - 가운데 점(한 장): 변 전체가 부드러운 곡선(포물선)으로 휨
   void _setPoint(int i, Offset p) {
+    if (i == _leftMid || i == _rightMid) {
+      // 변 가운데를 끌면 그 변이 포물선으로 휜다
+      final left = i == _leftMid;
+      final straight = Offset.lerp(
+          left ? _shape.top.first : _shape.top.last, left ? _shape.bottom.first : _shape.bottom.last, 0.5)!;
+      _shape = PageShape(_shape.top, _shape.bottom, _shape.spread,
+          leftBow: left ? p - straight : _shape.leftBow, rightBow: left ? _shape.rightBow : p - straight);
+      return;
+    }
     final edge = i < kPts ? _shape.top : _shape.bottom;
     final k = i < kPts ? i : i - kPts;
     if (k == kMid && !_shape.spread) {
@@ -148,7 +250,7 @@ class _CropScreenState extends State<CropScreen> {
         ],
         title: const Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Text('윤곽 수정'),
-          Text('모서리는 종이 끝 가까이 놓으면 붙어요 · 가운데 점은 굴곡',
+          Text('점은 종이 끝 가까이 놓으면 붙어요 · 변 가운데 점은 굴곡',
               style: TextStyle(fontSize: 12, color: Colors.white60)),
         ]),
       ),
@@ -168,7 +270,10 @@ class _CropScreenState extends State<CropScreen> {
                     );
                 final top = _shape.top.map(toScreen).toList();
                 final bottom = _shape.bottom.map(toScreen).toList();
-                final handles = [...top, ...bottom];
+                // 변 휨은 방향·크기 벡터라서 배율만 곱한다
+                final screenShape = PageShape(top, bottom, _shape.spread,
+                    leftBow: _shape.leftBow * s, rightBow: _shape.rightBow * s);
+                final handles = [...top, ...bottom, toScreen(_sideMid(true)), toScreen(_sideMid(false))];
 
                 return GestureDetector(
                   onPanStart: (e) {
@@ -195,7 +300,7 @@ class _CropScreenState extends State<CropScreen> {
                   onPanEnd: (_) {
                     final i = _dragging;
                     setState(() => _dragging = null);
-                    if (i != null) _snap(i);
+                    if (i != null) _afterDrop(i);
                   },
                   child: Stack(children: [
                     Positioned(
@@ -207,7 +312,7 @@ class _CropScreenState extends State<CropScreen> {
                     ),
                     Positioned.fill(
                       child: CustomPaint(
-                          painter: _ShapePainter(top, bottom, _shape.spread, _dragging, _snapped)),
+                          painter: _ShapePainter(screenShape, handles, _dragging, _snapped)),
                     ),
                     if (_dragging != null)
                       _Magnifier(
@@ -267,19 +372,23 @@ class _CropScreenState extends State<CropScreen> {
 }
 
 class _ShapePainter extends CustomPainter {
-  _ShapePainter(this.top, this.bottom, this.spread, this.active, this.snapped);
+  _ShapePainter(this.shape, this.pts, this.active, this.snapped);
+
+  /// 화면 좌표로 바꾼 윤곽
+  final PageShape shape;
+
+  /// 손잡이 위치 (위 점들, 아래 점들, 왼쪽 변 가운데, 오른쪽 변 가운데)
+  final List<Offset> pts;
 
   /// 방금 종이 모서리에 붙은 점 (빛나는 고리)
   final int? snapped;
-
-  final List<Offset> top, bottom;
-  final bool spread;
   final int? active;
 
   @override
   void paint(Canvas canvas, Size size) {
+    final top = shape.top, bottom = shape.bottom, spread = shape.spread;
     final t = sampleCurve(top), b = sampleCurve(bottom);
-    final path = Path()..addPolygon([...t, ...b.reversed], true);
+    final path = Path()..addPolygon(shape.outline(), true);
     // 페이지 바깥은 어둡게
     canvas.drawPath(
       Path.combine(PathOperation.difference, Path()..addRect(Offset.zero & size), path),
@@ -290,20 +399,26 @@ class _ShapePainter extends CustomPainter {
       ..style = PaintingStyle.stroke
       ..strokeWidth = 2.5;
     canvas.drawPath(path, line);
-    // 펴질 모양을 짐작할 수 있게 가로 안내선
+    // 펴질 모양을 짐작할 수 있게 가로 안내선 (좌우 변이 휘면 같이 휜다)
     final guide = Paint()
       ..color = Colors.lightBlueAccent.withValues(alpha: 0.35)
       ..strokeWidth = 1;
     for (var v = 0.25; v < 1; v += 0.25) {
       canvas.drawPoints(
-          PointMode.polygon, [for (var i = 0; i < t.length; i++) Offset.lerp(t[i], b[i], v)!], guide);
+          PointMode.polygon,
+          [
+            for (var i = 0; i < t.length; i++)
+              Offset.lerp(t[i], b[i], v)! +
+                  (shape.leftBow * (1 - i / (t.length - 1)) + shape.rightBow * (i / (t.length - 1))) *
+                      (4 * v * (1 - v)),
+          ],
+          guide);
     }
     if (spread) {
       canvas.drawLine(top[kMid], bottom[kMid], line..color = Colors.orangeAccent);
     }
-    final pts = [...top, ...bottom];
     for (var i = 0; i < pts.length; i++) {
-      // 잡을 수 있는 점만 그린다 (모서리 4개 + 가운데 2개)
+      // 잡을 수 있는 점만 그린다 (모서리 4개 + 변 가운데 4개)
       if (!_CropScreenState._visible.contains(i)) continue;
       final corner = i == 0 || i == kPts - 1 || i == kPts || i == 2 * kPts - 1;
       final spine = spread && (i == kMid || i == kPts + kMid);

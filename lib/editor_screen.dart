@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 
 import 'camera_screen.dart';
 import 'crop_screen.dart';
+import 'gallery_import.dart';
 import 'ocr.dart';
 import 'scanner.dart';
 import 'signature.dart';
@@ -260,6 +261,42 @@ class _EditorScreenState extends State<EditorScreen> {
     await _work(() => _replaceGroup(p, fresh));
   }
 
+  /// 페이지 추가: 카메라로 찍거나 갤러리에서 가져와 지금 페이지 뒤에 끼워 넣는다.
+  Future<void> _add() async {
+    final how = await showModalBottomSheet<String>(
+      context: context,
+      builder: (s) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          ListTile(
+              leading: const Icon(Icons.camera_alt_outlined),
+              title: const Text('카메라로 찍기'),
+              onTap: () => Navigator.pop(s, 'camera')),
+          ListTile(
+              leading: const Icon(Icons.photo_library_outlined),
+              title: const Text('갤러리에서 가져오기'),
+              onTap: () => Navigator.pop(s, 'gallery')),
+        ]),
+      ),
+    );
+    if (how == null || !mounted) return;
+    final fresh = how == 'camera'
+        ? await Navigator.push<List<ScanPage>>(
+            context, MaterialPageRoute(builder: (_) => const CameraScreen()))
+        : await pickAndScan(context);
+    if (fresh == null || fresh.isEmpty || !mounted) return;
+    _push();
+    final at = _index + 1;
+    setState(() {
+      _pages.insertAll(at, fresh);
+      _index = at;
+    });
+    // 새 페이지가 그려진 뒤에 그 페이지로 이동
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_pager.hasClients) _pager.jumpToPage(at);
+    });
+    _toast('${fresh.length}페이지를 추가했어요 · 되돌리기로 취소');
+  }
+
   void _delete() {
     if (_pages.length > 1) _push(); // 마지막 페이지를 지우면 화면이 닫힌다
     setState(() {
@@ -498,6 +535,7 @@ class _EditorScreenState extends State<EditorScreen> {
                 child: SingleChildScrollView(
                   scrollDirection: Axis.horizontal,
                   child: Row(children: [
+                    _Tool(Icons.add_photo_alternate_outlined, '추가하기', _busy ? null : _add),
                     _Tool(Icons.camera_alt_outlined, '다시 찍기', _busy ? null : _retake),
                     // 누르면 오른쪽 90°, 길게 누르면 왼쪽 90°
                     _Tool(Icons.rotate_right, '회전', _busy ? null : () => _rotate(1),
@@ -648,8 +686,7 @@ class _OutlinePainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     Offset sc(Offset p) => p * scale;
-    final t = sampleCurve(shape.top).map(sc).toList(), b = sampleCurve(shape.bottom).map(sc).toList();
-    final outline = Path()..addPolygon([...t, ...b.reversed], true);
+    final outline = Path()..addPolygon([for (final p in shape.outline()) sc(p)], true);
     canvas.drawPath(
       Path.combine(PathOperation.difference, Path()..addRect(Offset.zero & size), outline),
       Paint()..color = Colors.black45,

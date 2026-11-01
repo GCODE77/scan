@@ -243,12 +243,19 @@ class Store {
         'top': [for (final p in s.top) [p.dx, p.dy]],
         'bottom': [for (final p in s.bottom) [p.dx, p.dy]],
         'spread': s.spread,
+        if (s.leftBow != Offset.zero) 'leftBow': [s.leftBow.dx, s.leftBow.dy],
+        if (s.rightBow != Offset.zero) 'rightBow': [s.rightBow.dx, s.rightBow.dy],
       };
 
   static PageShape _shapeFrom(Map<String, dynamic> j) {
     List<Offset> pts(String k) =>
         [for (final p in j[k] as List) Offset((p[0] as num).toDouble(), (p[1] as num).toDouble())];
-    return PageShape(pts('top'), pts('bottom'), j['spread']);
+    Offset bow(String k) {
+      final v = j[k] as List?;
+      return v == null ? Offset.zero : Offset((v[0] as num).toDouble(), (v[1] as num).toDouble());
+    }
+
+    return PageShape(pts('top'), pts('bottom'), j['spread'], leftBow: bow('leftBow'), rightBow: bow('rightBow'));
   }
 
   // ── 폴더 ──
@@ -324,6 +331,10 @@ class Store {
           sh[edge] = [
             for (final pt in sh[edge] as List) [(pt[0] as num) * s, (pt[1] as num) * s],
           ];
+        }
+        for (final bow in ['leftBow', 'rightBow']) {
+          final v = sh[bow] as List?;
+          if (v != null) sh[bow] = [(v[0] as num) * s, (v[1] as num) * s];
         }
       }
     }

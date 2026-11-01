@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import 'camera_screen.dart';
+import 'gallery_import.dart';
 import 'editor_screen.dart';
 import 'ocr.dart';
 import 'pages.dart';
@@ -116,8 +117,10 @@ class _DocumentScreenState extends State<DocumentScreen> {
   /// 연속 촬영(자동 인식) → 편집 화면 → 문서에 추가.
   Future<void> _scan({bool first = false, bool gallery = false}) async {
     final nav = Navigator.of(context);
-    final fresh = await nav
-        .push<List<ScanPage>>(MaterialPageRoute(builder: (_) => CameraScreen(galleryFirst: gallery)));
+    // 갤러리에서 가져오기는 카메라 화면을 거치지 않고 바로 편집 화면으로
+    final fresh = gallery
+        ? await pickAndScan(context)
+        : await nav.push<List<ScanPage>>(MaterialPageRoute(builder: (_) => const CameraScreen()));
     if (fresh != null && fresh.isNotEmpty && mounted) {
       await nav.push(MaterialPageRoute(builder: (_) => EditorScreen(pages: fresh)));
     }
