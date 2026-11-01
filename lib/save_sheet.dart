@@ -371,9 +371,13 @@ Future<String?> runSave(List<ScanPage> pages, SaveOptions o, SaveTarget target) 
       case SaveFormat.png:
         final ext = f.name;
         for (var i = 0; i < pages.length; i++) {
-          final bytes = maxSide == null && ext == 'jpg'
-              ? pages[i].jpg
-              : await compute(transcode, (pages[i].jpg, ext, maxSide, quality));
+          // 배경을 제거한 페이지는 PNG에서 투명 배경 (JPG·PDF는 흰 배경)
+          final cut = pages[i].cutMask;
+          final bytes = ext == 'png' && cut != null
+              ? await compute(cutoutPng, (pages[i].jpg, cut, pages[i].quarterTurns, maxSide))
+              : maxSide == null && ext == 'jpg'
+                  ? pages[i].jpg
+                  : await compute(transcode, (pages[i].jpg, ext, maxSide, quality));
           final suffix = pages.length == 1 ? '' : '_${(i + 1).toString().padLeft(3, '0')}';
           outs.add(('${o.name}$suffix.$ext', bytes, ext == 'jpg' ? 'image/jpeg' : 'image/png'));
         }

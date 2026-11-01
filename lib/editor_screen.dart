@@ -1,13 +1,17 @@
+import 'dart:io';
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:google_mlkit_subject_segmentation/google_mlkit_subject_segmentation.dart';
+import 'package:path_provider/path_provider.dart';
 
 import 'camera_screen.dart';
 import 'crop_screen.dart';
 import 'gallery_import.dart';
 import 'ocr.dart';
+import 'rect_crop_screen.dart';
 import 'scanner.dart';
 import 'signature.dart';
 import 'theme.dart';
@@ -130,7 +134,8 @@ class _EditorScreenState extends State<EditorScreen> {
 
   /// 빛 반사 제거 / 기울기 보정처럼 편 이미지를 바로 고치는 작업. [all]이면 모든 페이지.
   /// [job]이 (새 이미지, 변화량)을 주면 적용하고, 변화량이 0이면 건너뛴다. 고친 페이지 수를 돌려준다.
-  Future<int> _fixFlat(Future<(Uint8List, double)> Function(Uint8List) job, {required bool all}) async {
+  Future<int> _fixFlat(Future<(Uint8List, double)> Function(Uint8List) job,
+      {required bool all, bool rotates = false}) async {
     var changed = 0;
     await _work(() async {
       _push();
@@ -138,6 +143,8 @@ class _EditorScreenState extends State<EditorScreen> {
         final (bytes, amount) = await job(p.flat);
         if (amount == 0) continue;
         p.flat = bytes;
+        // 이미지를 돌렸으면 배경 제거 마스크도 같은 각도로
+        if (rotates && p.cutMask != null) p.cutMask = await compute(rotateMask, (p.cutMask!, amount));
         await p.render();
         changed++;
       }
@@ -156,8 +163,116 @@ class _EditorScreenState extends State<EditorScreen> {
   }
 
   Future<void> _deskew({bool all = false}) async {
-    final n = await _fixFlat((f) => compute(deskewPage, f), all: all);
+    final n = await _fixFlat((f) => compute(deskewPage, f), all: all, rotates: true);
     _toast(n == 0 ? '이미 반듯하거나 기울기를 알 수 없어요' : '기울기를 바로잡았어요${all ? ' ($n페이지)' : ''} · 되돌리기로 취소');
+  }
+
+  /// 보이는 화면(회전 반영)에서 고른 영역(0~1)을 회전 전 편 이미지의 영역으로 바꾼다.
+  static Rect _toFlatRect(Rect v, int turns) => switch (turns % 4) {
+        1 => Rect.fromLTRB(v.top, 1 - v.right, v.bottom, 1 - v.left),
+        2 => Rect.fromLTRB(1 - v.right, 1 - v.bottom, 1 - v.left, 1 - v.top),
+        3 => Rect.fromLTRB(1 - v.bottom, v.left, 1 - v.top, v.right),
+        _ => v,
+      };
+
+  /// 사각형 영역 자르기: 쓰고 싶은 부분만 남기거나, 복사본 페이지로 따로 뽑는다.
+  Future<void> _areaCrop() async {
+    final p = _page;
+    final res = await Navigator.push<(Rect, bool)>(
+        context, MaterialPageRoute(builder: (_) => RectCropScreen(image: p.jpg)));
+    if (res == null || !mounted) return;
+    final (view, asCopy) = res;
+    final r = _toFlatRect(view, p.quarterTurns);
+    final box = [r.left, r.top, r.right, r.bottom];
+    var note = '';
+    await _work(() async {
+      _push();
+      final flat = await compute(cropNorm, (p.flat, box, false));
+      final mask = p.cutMask == null ? null : await compute(cropNorm, (p.cutMask!, box, true));
+      if (asCopy) {
+        // 자른 부분이 곧 새 페이지의 원본이 된다 (윤곽 수정을 다시 해도 안전)
+        final codec = await ui.instantiateImageCodec(flat);
+        final im = (await codec.getNextFrame()).image;
+        final w = im.width.toDouble(), h = im.height.toDouble();
+        final det = Detection(flat, im.width, im.height,
+            PageShape.quad([Offset.zero, Offset(w, 0), Offset(w, h), Offset(0, h)], false), true);
+        final copy = ScanPage(det: det, shape: det.shape, part: 0, flat: flat)
+          ..mode = p.mode
+          ..strength = p.strength
+          ..quarterTurns = p.quarterTurns
+          ..cutMask = mask;
+        await copy.render();
+        final at = _index + 1;
+        setState(() {
+          _pages.insert(at, copy);
+          _index = at;
+        });
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (_pager.hasClients) _pager.jumpToPage(at);
+        });
+        note = '잘라낸 부분을 새 페이지로 추가했어요';
+      } else {
+        p.flat = flat;
+        p.cutMask = mask;
+        if (p.rawFlat != null) p.rawFlat = await compute(cropNorm, (p.rawFlat!, box, false));
+        final hadStamps = p.stamps.isNotEmpty;
+        p.stamps.clear(); // 서명 위치는 원래 페이지 기준이라 자르면 어긋난다
+        await p.render();
+        note = hadStamps ? '잘랐어요 (서명은 위치가 어긋나 지웠어요)' : '잘랐어요';
+      }
+    });
+    _toast('$note · 되돌리기로 취소');
+  }
+
+  /// AI 배경 제거(기기 안에서 처리). 이미 제거한 페이지를 누르면 되돌린다. 길게 누르면 모든 페이지.
+  Future<void> _removeBg({bool all = false}) async {
+    if (!all && _page.cutMask != null) {
+      await _work(() async {
+        _push();
+        _page.cutMask = null;
+        await _page.render();
+      });
+      _toast('배경을 되돌렸어요');
+      return;
+    }
+    final targets = all ? _pages.where((p) => p.cutMask == null).toList() : [_page];
+    if (targets.isEmpty) return;
+    final seg = SubjectSegmenter(
+        options: SubjectSegmenterOptions(
+            enableForegroundBitmap: false,
+            enableForegroundConfidenceMask: true,
+            enableMultipleSubjects: SubjectResultOptions(enableConfidenceMask: false, enableSubjectBitmap: false)));
+    var done = 0;
+    String? err;
+    await _work(() async {
+      _push();
+      final dir = await getTemporaryDirectory();
+      try {
+        for (final p in targets) {
+          final (small, w, h, fw, fh) = await compute(prepSegment, p.flat);
+          final f = await File('${dir.path}/seg_${p.id}.jpg').writeAsBytes(small);
+          final res = await seg.processImage(InputImage.fromFilePath(f.path));
+          f.delete().ignore();
+          final conf = res.foregroundConfidenceMask;
+          if (conf == null || conf.length != w * h) {
+            err = '배경을 인식하지 못했어요';
+            continue;
+          }
+          p.cutMask = await compute(buildCutMask, (conf, w, h, fw, fh));
+          await p.render();
+          done++;
+        }
+      } catch (e) {
+        err = '배경 제거에 실패했어요 (처음 한 번은 인터넷 연결이 필요할 수 있어요)\n$e';
+        debugPrint('배경 제거 실패: $e');
+      } finally {
+        await seg.close();
+      }
+      if (done == 0 && _history.isNotEmpty) _history.removeLast();
+    });
+    _toast(done > 0
+        ? '배경을 지웠어요${all ? ' ($done페이지)' : ''} · PNG로 저장하면 투명 배경 · 되돌리기로 취소'
+        : (err ?? '배경을 지우지 못했어요'));
   }
 
   /// 서명 넣기 (이미 있으면 추가/모두 지우기 선택)
@@ -540,7 +655,12 @@ class _EditorScreenState extends State<EditorScreen> {
                     // 누르면 오른쪽 90°, 길게 누르면 왼쪽 90°
                     _Tool(Icons.rotate_right, '회전', _busy ? null : () => _rotate(1),
                         onLongPress: _busy ? null : () => _rotate(-1)),
-                    _Tool(Icons.crop, '자르기', _busy ? null : _crop),
+                    _Tool(Icons.crop, '윤곽 수정', _busy ? null : _crop),
+                    _Tool(Icons.crop_free_rounded, '영역 자르기', _busy ? null : _areaCrop),
+                    // 누르면 이 페이지(다시 누르면 복원), 길게 누르면 모든 페이지
+                    _Tool(_page.cutMask != null ? Icons.layers_clear_rounded : Icons.auto_awesome_rounded,
+                        _page.cutMask != null ? '배경 복원' : '배경 제거', _busy ? null : _removeBg,
+                        onLongPress: _busy ? null : () => _removeBg(all: true)),
                     _Tool(Icons.text_fields, '텍스트 추출', _busy ? null : _extractText),
                     _Tool(_page.cleaned ? Icons.auto_fix_off_rounded : Icons.auto_fix_high_rounded,
                         _page.cleaned ? '정리 취소' : '자동 정리', _busy ? null : _clean),
@@ -721,6 +841,7 @@ class _Snapshot {
             p: (
               flat: p.flat,
               rawFlat: p.rawFlat,
+              cutMask: p.cutMask,
               jpg: p.jpg,
               mode: p.mode,
               strength: p.strength,
@@ -740,6 +861,7 @@ class _Snapshot {
       ({
         Uint8List flat,
         Uint8List? rawFlat,
+        Uint8List? cutMask,
         Uint8List jpg,
         ScanMode mode,
         double strength,
@@ -759,6 +881,7 @@ class _Snapshot {
       p
         ..flat = s.flat
         ..rawFlat = s.rawFlat
+        ..cutMask = s.cutMask
         ..jpg = s.jpg
         ..mode = s.mode
         ..strength = s.strength

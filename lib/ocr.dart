@@ -52,6 +52,9 @@ class ScanPage {
   bool cleaned = false;
   Uint8List? rawFlat;
 
+  /// 배경 제거 마스크(PNG, 편 이미지 크기·방향, 흰색=남김). 있으면 최종 이미지의 배경이 흰색으로 바뀐다.
+  Uint8List? cutMask;
+
   /// 페이지에 얹은 서명들
   final List<Stamp> stamps = [];
   Uint8List jpg;
@@ -62,6 +65,7 @@ class ScanPage {
     var out = mode == ScanMode.original && quarterTurns % 4 == 0
         ? flat
         : await compute(renderPage, (flat, mode, quarterTurns, null, strength));
+    if (cutMask != null) out = await compute(applyCut, (out, cutMask!, quarterTurns));
     if (stamps.isNotEmpty) {
       out = await compute(stampPage, (
         out,

@@ -104,6 +104,11 @@ class Store {
         ..cleaned = pj['cleaned'] == true;
       final pageFile = File('${dir.path}/page_$id.jpg');
       if (await pageFile.exists()) p.jpg = await pageFile.readAsBytes();
+      final maskFile = File('${dir.path}/mask_$id.png');
+      if (await maskFile.exists()) {
+        p.cutMask = await maskFile.readAsBytes();
+        _savedMask[p] = p.cutMask;
+      }
       for (final (i, sj) in ((pj['stamps'] as List?) ?? const []).indexed) {
         final f = File('${dir.path}/stamp_${id}_$i.png');
         if (!await f.exists()) continue;
@@ -127,6 +132,7 @@ class Store {
 
   /// 마지막으로 파일에 쓴 이미지 (바뀐 것만 다시 쓰기 위해)
   static final _saved = Expando<(Uint8List, Uint8List)>();
+  static final _savedMask = Expando<Uint8List>();
 
   /// 같은 문서의 저장이 겹치지 않도록 줄 세운다.
   static final _queues = <String, Future<void>>{};
@@ -166,6 +172,14 @@ class Store {
         await File('${dir.path}/page_${p.id}.jpg').writeAsBytes(p.jpg);
       }
       _saved[p] = (p.flat, p.jpg);
+      // 배경 제거 마스크
+      if (p.cutMask != null) {
+        keep.add('mask_${p.id}.png');
+        if (!identical(_savedMask[p], p.cutMask)) {
+          await File('${dir.path}/mask_${p.id}.png').writeAsBytes(p.cutMask!);
+        }
+      }
+      _savedMask[p] = p.cutMask;
     }
 
     if (doc.pages.isNotEmpty) {

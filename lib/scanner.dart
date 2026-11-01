@@ -1734,3 +1734,95 @@ Future<List<Offset>> snapEdgePoints((Uint8List, List<Offset>, int, List<Offset>)
   }
   return pts;
 }
+
+// ───────────────────────── 배경 제거 · 영역 자르기 ─────────────────────────
+
+cv.Mat _rotQ(cv.Mat m, int turns) {
+  final r = turns % 4;
+  return r == 0
+      ? m
+      : cv.rotate(m, const [0, cv.ROTATE_90_CLOCKWISE, cv.ROTATE_180, cv.ROTATE_90_COUNTERCLOCKWISE][r]);
+}
+
+/// isolate에서 실행된다: 배경 제거 준비 — 인식용으로 줄인 사진. (JPG, 너비, 높이, 원본 너비, 원본 높이)
+Future<(Uint8List, int, int, int, int)> prepSegment(Uint8List flat) async {
+  var img = cv.imdecode(flat, cv.IMREAD_COLOR);
+  final fw = img.cols, fh = img.rows;
+  final s = math.min(1.0, 1024 / math.max(fw, fh));
+  if (s < 1) img = cv.resize(img, ((fw * s).round(), (fh * s).round()), interpolation: cv.INTER_AREA);
+  return (_encode(img), img.cols, img.rows, fw, fh);
+}
+
+/// isolate에서 실행된다: 대상 확신도(0~1, 줄인 사진 크기)를 원본 크기의 마스크(PNG, 흰색=남김)로.
+Future<Uint8List> buildCutMask((List<double>, int, int, int, int) args) async {
+  final (conf, w, h, fw, fh) = args;
+  final bytes = Uint8List(w * h);
+  for (var i = 0; i < bytes.length; i++) {
+    bytes[i] = (conf[i].clamp(0.0, 1.0) * 255).round();
+  }
+  var m = cv.Mat.fromList(h, w, cv.MatType.CV_8UC1, bytes);
+  if (w != fw || h != fh) m = cv.resize(m, (fw, fh), interpolation: cv.INTER_CUBIC);
+  m = cv.gaussianBlur(m, (5, 5), 0);
+  // 경계 대비를 올린다: 확신도 35% 이하는 배경, 65% 이상은 대상, 그 사이는 부드럽게
+  m = m.convertTo(cv.MatType.CV_8UC1, alpha: 255 / 76.5, beta: -89.25 * 255 / 76.5);
+  return cv.imencode('.png', m).$2;
+}
+
+/// isolate에서 실행된다: 마스크 밖(배경)을 흰색으로 채운다. 마스크는 편 이미지 방향이라 [turns]만큼 같이 돌린다.
+Future<Uint8List> applyCut((Uint8List, Uint8List, int) args) async {
+  final (jpg, maskPng, turns) = args;
+  final img = cv.imdecode(jpg, cv.IMREAD_COLOR);
+  var m = _rotQ(cv.imdecode(maskPng, cv.IMREAD_GRAYSCALE), turns);
+  final w = img.cols, h = img.rows;
+  if (m.cols != w || m.rows != h) m = cv.resize(m, (w, h), interpolation: cv.INTER_LINEAR);
+  final id = Uint8List.fromList(img.data), md = m.data;
+  for (var i = 0; i < w * h; i++) {
+    final a = md[i];
+    if (a == 255) continue;
+    final inv = 255 - a;
+    for (var c = 0; c < 3; c++) {
+      id[i * 3 + c] = (id[i * 3 + c] * a + 255 * inv + 127) ~/ 255;
+    }
+  }
+  return _encode(cv.Mat.fromList(h, w, cv.MatType.CV_8UC3, id));
+}
+
+/// isolate에서 실행된다: 배경이 투명한 PNG. (최종 JPG, 마스크 PNG, 마스크를 돌릴 90도 수, 긴 변 최대 픽셀)
+Future<Uint8List> cutoutPng((Uint8List, Uint8List, int, int?) args) async {
+  final (jpg, maskPng, turns, maxSide) = args;
+  var img = cv.imdecode(jpg, cv.IMREAD_COLOR);
+  var m = _rotQ(cv.imdecode(maskPng, cv.IMREAD_GRAYSCALE), turns);
+  if (m.cols != img.cols || m.rows != img.rows) m = cv.resize(m, (img.cols, img.rows), interpolation: cv.INTER_LINEAR);
+  if (maxSide != null) {
+    final s = maxSide / math.max(img.cols, img.rows);
+    if (s < 1) {
+      final size = ((img.cols * s).round(), (img.rows * s).round());
+      img = cv.resize(img, size, interpolation: cv.INTER_AREA);
+      m = cv.resize(m, size, interpolation: cv.INTER_AREA);
+    }
+  }
+  final ch = cv.split(img);
+  return cv.imencode('.png', cv.merge(cv.VecMat.fromList([ch[0], ch[1], ch[2], m]))).$2;
+}
+
+/// isolate에서 실행된다: 기울기 보정으로 이미지를 돌린 만큼 마스크(PNG)도 같이 돌린다.
+Future<Uint8List> rotateMask((Uint8List, double) args) async {
+  final (maskPng, angle) = args;
+  final m = cv.imdecode(maskPng, cv.IMREAD_GRAYSCALE);
+  final r = cv.warpAffine(m, cv.getRotationMatrix2D(cv.Point2f(m.cols / 2, m.rows / 2), angle, 1), (m.cols, m.rows),
+      borderMode: cv.BORDER_REPLICATE);
+  return cv.imencode('.png', r).$2;
+}
+
+/// isolate에서 실행된다: 사진(또는 마스크 PNG)에서 사각형 영역만 잘라낸다.
+/// (데이터, [왼쪽, 위, 오른쪽, 아래] 0~1 비율, 마스크인지)
+Future<Uint8List> cropNorm((Uint8List, List<double>, bool) args) async {
+  final (data, r, isMask) = args;
+  final img = cv.imdecode(data, isMask ? cv.IMREAD_GRAYSCALE : cv.IMREAD_COLOR);
+  final x0 = (r[0] * img.cols).round().clamp(0, img.cols - 1);
+  final y0 = (r[1] * img.rows).round().clamp(0, img.rows - 1);
+  final x1 = (r[2] * img.cols).round().clamp(x0 + 1, img.cols);
+  final y1 = (r[3] * img.rows).round().clamp(y0 + 1, img.rows);
+  final c = img.region(cv.Rect(x0, y0, x1 - x0, y1 - y0)).clone();
+  return isMask ? cv.imencode('.png', c).$2 : _encode(c);
+}
