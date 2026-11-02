@@ -250,7 +250,7 @@ class _CropScreenState extends State<CropScreen> {
         ],
         title: const Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Text('윤곽 수정'),
-          Text('점은 종이 끝 가까이 놓으면 붙어요 · 변 가운데 점은 굴곡',
+          Text('파랑 점=모서리(종이 끝에 붙어요) · 분홍 점=변 가운데(굴곡)',
               style: TextStyle(fontSize: 12, color: Colors.white60)),
         ]),
       ),
@@ -438,8 +438,8 @@ class _ShapePainter extends CustomPainter {
             ..color = spine
                 ? Colors.orangeAccent
                 : corner
-                    ? Colors.lightBlueAccent
-                    : Colors.lightBlue.shade200);
+                    ? Colors.lightBlueAccent // 모서리: 파랑
+                    : Colors.pinkAccent); // 변 가운데: 분홍 (모서리와 한눈에 구분)
     }
   }
 

@@ -1661,9 +1661,41 @@ Future<Uint8List> stitchLong((List<Uint8List>, int) args) async {
   return cv.imencode('.jpg', out, params: cv.VecI32.fromList([cv.IMWRITE_JPEG_QUALITY, quality])).$2;
 }
 
+/// 종이 색(Lab): 사각형 안쪽(가운데 60%)에서 밝은 쪽 절반의 중앙값.
+List<double>? _paperLab(_Grad g, List<Offset> q) {
+  final center = q.reduce((a, b) => a + b) / 4;
+  final px = <List<double>>[];
+  for (var i = 0; i <= 20; i++) {
+    for (var j = 0; j <= 20; j++) {
+      final top = Offset.lerp(q[0], q[1], i / 20)!, bot = Offset.lerp(q[3], q[2], i / 20)!;
+      final p = center + (Offset.lerp(top, bot, j / 20)! - center) * 0.6;
+      final x = p.dx.round(), y = p.dy.round();
+      if (x < 0 || y < 0 || x >= g.w || y >= g.h) continue;
+      final k = (y * g.w + x) * 3;
+      px.add([g.lab[k].toDouble(), g.lab[k + 1].toDouble(), g.lab[k + 2].toDouble()]);
+    }
+  }
+  if (px.length < 20) return null;
+  px.sort((a, b) => a[0].compareTo(b[0]));
+  final bright = px.sublist(px.length ~/ 2);
+  double med(int c) => (bright.map((e) => e[c]).toList()..sort())[bright.length ~/ 2];
+  return [med(0), med(1), med(2)];
+}
+
+/// Lab 색차. 밝기 차는 그림자 때문에 절반만 반영한다.
+double _labDist(List<double> a, List<double> b) {
+  final dl = (a[0] - b[0]) * 0.5, da = a[1] - b[1], db = a[2] - b[2];
+  return math.sqrt(dl * dl + da * da + db * db);
+}
+
 /// isolate에서 실행된다: 변 위의 점들을 가까운 실제 종이 경계에 붙인다 (포토샵 자석 올가미처럼).
 /// (원본 JPG, 네 모서리 [좌상·우상·우하·좌하], 변 번호 [0=위 1=오른쪽 2=아래 3=왼쪽], 변 위의 점들)
-/// → 붙은 점들. 확실하지 않은 점은 그대로 둔다.
+/// → 붙은 점들. 확실하지 않으면 그대로 둔다.
+///
+/// 종이와 바닥의 경계는 밝기보다 '색'이 더 뚜렷할 때가 많아 Lab 색차로 찾는다.
+/// 본문 글자 줄·접힌 선은 경계 뒤에 종이가 다시 나오므로 걸러내고(경계 뒤가 계속 다른 색이어야 함),
+/// 남은 경계 중 가장 바깥쪽의 뚜렷한 것을 고른다. 마지막으로 점들이 한 직선(기울기 허용)에 놓이도록
+/// RANSAC으로 튄 점을 버린다.
 Future<List<Offset>> snapEdgePoints((Uint8List, List<Offset>, int, List<Offset>) args) async {
   final (jpg, quad, edge, pts) = args;
   if (pts.isEmpty) return pts;
@@ -1676,63 +1708,198 @@ Future<List<Offset>> snapEdgePoints((Uint8List, List<Offset>, int, List<Offset>)
   final a = q[edge], b = q[(edge + 1) % 4];
   final d = b - a, len = d.distance;
   if (len < 10) return pts;
+  final tan = d / len;
   // 바깥쪽(종이에서 멀어지는 쪽)을 가리키는 법선
-  var n = Offset(-d.dy, d.dx) / len;
-  if ((center - (a + b) / 2).dx * n.dx + (center - (a + b) / 2).dy * n.dy > 0) n = -n;
+  var n = Offset(-tan.dy, tan.dx);
+  final toCenter = center - (a + b) / 2;
+  if (toCenter.dx * n.dx + toCenter.dy * n.dy > 0) n = -n;
   final band = math.max(10, (diag * 0.07).round()); // 이 범위 안의 경계만 붙는다
 
-  double mean(List<double> v, int from, int to) {
-    var sum = 0.0;
-    for (var i = from; i < to; i++) {
-      sum += v[i];
-    }
-    return sum / (to - from);
+  final paper = _paperLab(g, q);
+  if (paper == null) return pts;
+
+  List<double> labAt(Offset p) {
+    final x = p.dx.round(), y = p.dy.round();
+    if (x < 0 || y < 0 || x >= g.w || y >= g.h) return [0, 128, 128];
+    final k = (y * g.w + x) * 3;
+    return [g.lab[k].toDouble(), g.lab[k + 1].toDouble(), g.lab[k + 2].toDouble()];
   }
 
-  // 색 기준을 먼저, 안 되면 흰 종이 기준으로
-  for (final byColor in [true, false]) {
-    final m = _paperModel(g, q, byColor: byColor);
-    if (m == null) continue;
-    final offs = <double?>[];
-    for (final p0 in pts) {
-      final p = p0 * g.s;
-      // 바깥(+)으로 갈수록 종이가 아니게 되는 경계 중, 대비가 크고 가까운 것
-      final prof = [for (var j = -band - 8; j <= band + 8; j++) m.paperness(p + n * j.toDouble())];
-      double? best;
-      var bestScore = double.negativeInfinity;
-      for (var i = 8; i < prof.length - 8; i++) {
-        final inside = mean(prof, i - 7, i - 2), outside = mean(prof, i + 2, i + 7);
-        if (inside > m.inT && outside < m.inT - m.gap && inside - outside > m.minDiff) {
-          final off = (i - band - 8).toDouble();
-          final score = (inside - outside) - 0.5 * off.abs();
-          if (score > bestScore) {
-            bestScore = score;
-            best = off;
+  List<double> meanOf(List<List<double>> prof, int from, int to) {
+    final m = [0.0, 0.0, 0.0];
+    for (var i = from; i < to; i++) {
+      for (var c = 0; c < 3; c++) {
+        m[c] += prof[i][c];
+      }
+    }
+    return [for (final v in m) v / (to - from)];
+  }
+
+  // 점마다 바깥쪽(+)으로 갈수록 종이 색에서 멀어지는 경계 후보를 찾는다
+  final offs = <double?>[];
+  for (final p0 in pts) {
+    final p = p0 * g.s;
+    // 변과 나란한 -10·0·+10 지점의 평균 (잡티·글자 한 획에 덜 흔들리게)
+    final prof = <List<double>>[];
+    for (var j = -band - 10; j <= band + 10; j++) {
+      final acc = [0.0, 0.0, 0.0];
+      for (final s in const [-10.0, 0.0, 10.0]) {
+        final l = labAt(p + n * j.toDouble() + tan * s);
+        for (var c = 0; c < 3; c++) {
+          acc[c] += l[c] / 3;
+        }
+      }
+      prof.add(acc);
+    }
+    final m = prof.length;
+    final cands = <(int, double)>[]; // (오프셋, 색차)
+    for (var i = 10; i < m - 10; i++) {
+      final inside = meanOf(prof, i - 9, i - 1), outside = meanOf(prof, i + 2, i + 10);
+      final s = _labDist(inside, outside);
+      if (s < 7 || _labDist(inside, paper) > 22) continue; // 색차가 작거나, 안쪽이 종이 같지 않다
+      // 경계 뒤가 계속 다른 색이어야 한다 (뒤에 종이가 다시 나오면 글자 줄·접힌 선)
+      var far = 0, total = 0;
+      for (var k = i + 3; k < math.min(m, i + 28); k++) {
+        total++;
+        if (_labDist(prof[k], inside) >= 0.5 * s) far++;
+      }
+      if (total == 0 || far / total < 0.8) continue;
+      cands.add((i - band - 10, s));
+    }
+    final loc = [
+      for (final (o, s) in cands)
+        if (cands.every((c) => (c.$1 - o).abs() > 6 || s >= c.$2)) (o, s),
+    ];
+    if (loc.isEmpty) {
+      offs.add(null);
+      continue;
+    }
+    final smax = loc.map((c) => c.$2).reduce(math.max);
+    // 뚜렷한 경계 중 가장 바깥쪽 (글자 줄은 종이 안쪽에 있다)
+    offs.add(loc.where((c) => c.$2 >= 0.45 * smax).map((c) => c.$1).reduce(math.max).toDouble());
+  }
+
+  final nPts = pts.length;
+  final xs = <double>[], vs = <double>[];
+  for (var i = 0; i < nPts; i++) {
+    final o = offs[i];
+    if (o != null) {
+      xs.add(nPts == 1 ? 0.5 : i / (nPts - 1));
+      vs.add(o);
+    }
+  }
+  if (xs.length < nPts * 0.6) return pts;
+
+  // 점들을 한 줄로 모으는 모델을 고른다. 튄 점(글자 줄 등)은 RANSAC으로 버린다.
+  double Function(double)? fit;
+
+  // 1) 곡선(이차): 점이 4개 이상이고 거의 모두(4/5)가 6px 안에서 한 포물선에 놓이며, 그 휨이
+  //    종이 변이 휠 수 있는 한계(변 길이의 8%) 안일 때만 쓴다 (휜 변)
+  final tolQ = math.max(5.0, band * 0.06);
+  if (xs.length >= 4) {
+    var bestIn = <int>[];
+    List<double>? bestC;
+    for (var i = 0; i < xs.length; i++) {
+      for (var j = i + 1; j < xs.length; j++) {
+        for (var k = j + 1; k < xs.length; k++) {
+          final x1 = xs[i], x2 = xs[j], x3 = xs[k];
+          final d1 = (x1 - x2) * (x1 - x3), d2 = (x2 - x1) * (x2 - x3), d3 = (x3 - x1) * (x3 - x2);
+          final c = [
+            vs[i] / d1 + vs[j] / d2 + vs[k] / d3,
+            -(vs[i] * (x2 + x3) / d1 + vs[j] * (x1 + x3) / d2 + vs[k] * (x1 + x2) / d3),
+            vs[i] * x2 * x3 / d1 + vs[j] * x1 * x3 / d2 + vs[k] * x1 * x2 / d3,
+          ];
+          double v(double x) => (c[0] * x + c[1]) * x + c[2];
+          if ((v(0.5) - (v(0) + v(1)) / 2).abs() > 0.08 * len) continue;
+          final inl = [
+            for (var t = 0; t < xs.length; t++)
+              if ((vs[t] - v(xs[t])).abs() <= tolQ) t,
+          ];
+          if (inl.length > bestIn.length) {
+            bestIn = inl;
+            bestC = c;
           }
         }
       }
-      offs.add(best);
     }
-    final found = [for (final o in offs) ?o];
-    if (found.length < pts.length * 0.6) continue;
-    final sorted = [...found]..sort();
-    final med = sorted[sorted.length ~/ 2];
-    // 중앙값에서 크게 벗어난 점은 오검출 (글씨·무늬 경계 등): 중앙값으로 대신
-    var good = 0;
-    final res = <Offset>[];
-    for (var i = 0; i < pts.length; i++) {
-      var o = offs[i];
-      if (o == null || (o - med).abs() > band * 0.5) {
-        o = med;
-      } else {
-        good++;
+    if (bestC != null && bestIn.length >= math.max(4, (nPts * 0.8).ceil())) {
+      // 맞는 점들로 최소제곱 이차식을 다시 맞춘다 (정규방정식 3×3)
+      final m = List.generate(3, (_) => List<double>.filled(4, 0));
+      for (final i in bestIn) {
+        final x = xs[i], row = [x * x, x, 1.0];
+        for (var r = 0; r < 3; r++) {
+          for (var c2 = 0; c2 < 3; c2++) {
+            m[r][c2] += row[r] * row[c2];
+          }
+          m[r][3] += row[r] * vs[i];
+        }
       }
-      res.add(pts[i] + n * (o / g.s));
+      var ok = true;
+      for (var col = 0; col < 3 && ok; col++) {
+        var piv = col;
+        for (var r = col + 1; r < 3; r++) {
+          if (m[r][col].abs() > m[piv][col].abs()) piv = r;
+        }
+        if (m[piv][col].abs() < 1e-9) {
+          ok = false;
+          break;
+        }
+        final tmp = m[col];
+        m[col] = m[piv];
+        m[piv] = tmp;
+        for (var r = 0; r < 3; r++) {
+          if (r == col) continue;
+          final f = m[r][col] / m[col][col];
+          for (var c2 = col; c2 < 4; c2++) {
+            m[r][c2] -= f * m[col][c2];
+          }
+        }
+      }
+      if (ok) {
+        final c = [m[0][3] / m[0][0], m[1][3] / m[1][1], m[2][3] / m[2][2]];
+        fit = (x) => (c[0] * x + c[1]) * x + c[2];
+      }
     }
-    if (good < pts.length * 0.5) continue;
-    return res;
   }
-  return pts;
+
+  // 2) 직선(기울기 허용, 점이 3개 이하면 상수): 가장 많은 점이 맞는 것
+  if (fit == null) {
+    final tol = math.max(7.0, band * 0.12);
+    final k2 = xs.length >= 4;
+    var bestIn = <int>[];
+    for (var i = 0; i < xs.length; i++) {
+      for (var j = k2 ? i + 1 : i; j < (k2 ? xs.length : i + 1); j++) {
+        final slope = k2 ? (vs[j] - vs[i]) / (xs[j] - xs[i]) : 0.0;
+        final inl = [
+          for (var t = 0; t < xs.length; t++)
+            if ((vs[t] - (vs[i] + slope * (xs[t] - xs[i]))).abs() <= tol) t,
+        ];
+        if (inl.length > bestIn.length) bestIn = inl;
+      }
+    }
+    if (bestIn.length < math.max(2, (nPts * 0.5).ceil())) return pts; // 일관된 경계가 없으면 손대지 않는다
+    if (k2 && bestIn.length >= 3) {
+      final mx = bestIn.map((i) => xs[i]).reduce((a, b) => a + b) / bestIn.length;
+      final my = bestIn.map((i) => vs[i]).reduce((a, b) => a + b) / bestIn.length;
+      var sxy = 0.0, sxx = 0.0;
+      for (final i in bestIn) {
+        sxy += (xs[i] - mx) * (vs[i] - my);
+        sxx += (xs[i] - mx) * (xs[i] - mx);
+      }
+      final slope = sxx == 0 ? 0.0 : sxy / sxx;
+      final icpt = my - slope * mx;
+      fit = (x) => icpt + slope * x;
+    } else {
+      final sorted = [for (final i in bestIn) vs[i]]..sort();
+      final med = sorted[sorted.length ~/ 2];
+      fit = (x) => med;
+    }
+  }
+
+  final f = fit;
+  return [
+    for (var i = 0; i < nPts; i++) pts[i] + n * (f(nPts == 1 ? 0.5 : i / (nPts - 1)) / g.s),
+  ];
 }
 
 // ───────────────────────── 배경 제거 · 영역 자르기 ─────────────────────────

@@ -270,7 +270,7 @@ class _CropPainter extends CustomPainter {
       final corner = const {_Grip.tl, _Grip.tr, _Grip.bl, _Grip.br}.contains(g.key);
       final r = g.key == active ? 15.0 : (corner ? 12.0 : 9.0);
       canvas.drawCircle(g.value, r, Paint()..color = Colors.white);
-      canvas.drawCircle(g.value, r - 3, Paint()..color = corner ? Colors.lightBlueAccent : Colors.lightBlue.shade200);
+      canvas.drawCircle(g.value, r - 3, Paint()..color = corner ? Colors.lightBlueAccent : Colors.pinkAccent);
     }
   }
 
