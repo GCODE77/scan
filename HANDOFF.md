@@ -1,7 +1,7 @@
 # 북스캔 — 세션 핸드오프
 
 - 최종 갱신: 2026-11-02
-- 배포된 최신: **v0.25.1** (https://github.com/GCODE77/scan/releases/latest) — 2026-11-02 배포
+- 배포된 최신: **v0.25.1** (https://github.com/GCODE77/scan/releases/latest) — 2026-11-03 배포
 - 저작권: © 2026 GLORY KIM
 - 저장소: GCODE77/scan (main). 앱은 이 저장소의 최신 릴리스를 확인해 스스로 업데이트한다.
 
