@@ -1638,6 +1638,7 @@ Future<double> sharpness(Uint8List jpg) async {
 /// isolate에서 실행된다: 페이지 사진들을 세로로 이어 붙여 긴 사진 한 장으로. (JPG 목록, JPG 화질)
 Future<Uint8List> stitchLong((List<Uint8List>, int) args) async {
   final (jpgs, quality) = args;
+  if (jpgs.isEmpty) return Uint8List(0);
   // 가로 폭을 맞춘다. 사진이 너무 길어지지 않게 (JPG 한계 65535px) 전체 높이를 3만 픽셀 안으로
   final ratios = <double>[
     for (final j in jpgs)
@@ -1647,7 +1648,7 @@ Future<Uint8List> stitchLong((List<Uint8List>, int) args) async {
       }(),
   ];
   final sum = ratios.fold<double>(0, (a, b) => a + b);
-  final width = math.max(200, math.min(1200, (30000 / sum).floor()));
+  final width = math.max(100, math.min(1200, (30000 / sum).floor()));
   final heights = [for (final r in ratios) math.max(1, (width * r).round())];
   final buf = Uint8List(heights.fold<int>(0, (a, b) => a + b) * width * 3);
   var off = 0;
@@ -1960,6 +1961,16 @@ Future<Uint8List> cutoutPng((Uint8List, Uint8List, int, int?) args) async {
   var img = cv.imdecode(jpg, cv.IMREAD_COLOR);
   var m = _rotQ(cv.imdecode(maskPng, cv.IMREAD_GRAYSCALE), turns);
   if (m.cols != img.cols || m.rows != img.rows) m = cv.resize(m, (img.cols, img.rows), interpolation: cv.INTER_LINEAR);
+  // 이미지는 이미 흰 바탕과 섞여 있다(applyCut). 반투명 경계 픽셀의 원래 색을 되돌려 흰 띠를 없앤다.
+  final id = Uint8List.fromList(img.data), md = m.data;
+  for (var i = 0; i < img.cols * img.rows; i++) {
+    final a = md[i];
+    if (a == 0 || a == 255) continue;
+    for (var c = 0; c < 3; c++) {
+      id[i * 3 + c] = (((id[i * 3 + c] - 255 + a) * 255) ~/ a).clamp(0, 255);
+    }
+  }
+  img = cv.Mat.fromList(img.rows, img.cols, cv.MatType.CV_8UC3, id);
   if (maxSide != null) {
     final s = maxSide / math.max(img.cols, img.rows);
     if (s < 1) {
@@ -1992,4 +2003,50 @@ Future<Uint8List> cropNorm((Uint8List, List<double>, bool) args) async {
   final y1 = (r[3] * img.rows).round().clamp(y0 + 1, img.rows);
   final c = img.region(cv.Rect(x0, y0, x1 - x0, y1 - y0)).clone();
   return isMask ? cv.imencode('.png', c).$2 : _encode(c);
+}
+
+/// isolate에서 실행된다: AI 모델을 쓸 수 없을 때의 배경 제거(OpenCV GrabCut). 사진 가장자리 4%는 배경으로 보고,
+/// 그 안쪽에서 대상을 찾는다. 배경이 단순할수록 잘 된다. 결과는 [buildCutMask]와 같은 마스크(PNG).
+Future<Uint8List> grabCutMask(Uint8List flat) async {
+  final img = cv.imdecode(flat, cv.IMREAD_COLOR);
+  final fw = img.cols, fh = img.rows;
+  final s = math.min(1.0, 640 / math.max(fw, fh));
+  final small = s < 1 ? cv.resize(img, ((fw * s).round(), (fh * s).round()), interpolation: cv.INTER_AREA) : img;
+  final sw = small.cols, sh = small.rows;
+  final mask = cv.Mat.zeros(sh, sw, cv.MatType.CV_8UC1);
+  final bgd = cv.Mat.zeros(1, 65, cv.MatType.CV_64FC1), fgd = cv.Mat.zeros(1, 65, cv.MatType.CV_64FC1);
+  final rect = cv.Rect((sw * 0.04).round(), (sh * 0.04).round(), (sw * 0.92).round(), (sh * 0.92).round());
+  cv.grabCut(small, mask, rect, bgd, fgd, 5, mode: cv.GC_INIT_WITH_RECT);
+  // 대상(1) 또는 대상일 듯(3)만 남긴다
+  final md = mask.data;
+  var fg = Uint8List(sw * sh);
+  for (var i = 0; i < fg.length; i++) {
+    if (md[i] == 1 || md[i] == 3) fg[i] = 255;
+  }
+  var m = cv.Mat.fromList(sh, sw, cv.MatType.CV_8UC1, fg);
+  // 가장 큰 덩어리만 남기고 구멍을 메운다
+  final labels = cv.Mat.empty(), stats = cv.Mat.empty(), cents = cv.Mat.empty();
+  final cnt = cv.connectedComponentsWithStats(m, labels, stats, cents, 8, cv.MatType.CV_32S, -1);
+  if (cnt > 1) {
+    var best = 1, bestArea = 0;
+    for (var i = 1; i < cnt; i++) {
+      final a = stats.at<int>(i, 4);
+      if (a > bestArea) {
+        bestArea = a;
+        best = i;
+      }
+    }
+    final lab = Uint8List.fromList(labels.data).buffer.asInt32List();
+    fg = Uint8List(sw * sh);
+    for (var i = 0; i < fg.length; i++) {
+      if (lab[i] == best) fg[i] = 255;
+    }
+    m = cv.Mat.fromList(sh, sw, cv.MatType.CV_8UC1, fg);
+  }
+  m = cv.morphologyEx(m, cv.MORPH_CLOSE, cv.getStructuringElement(cv.MORPH_RECT, (9, 9)));
+  // 대상이 거의 없으면(3% 미만) 실패로 본다: 그대로 쓰면 페이지가 통째로 흰색이 된다
+  if (cv.countNonZero(m) < sw * sh * 0.03) return Uint8List(0);
+  if (s < 1) m = cv.resize(m, (fw, fh), interpolation: cv.INTER_CUBIC);
+  m = cv.gaussianBlur(m, (5, 5), 0);
+  return cv.imencode('.png', m).$2;
 }

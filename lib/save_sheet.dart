@@ -113,9 +113,14 @@ Future<(SaveOptions, SaveTarget)?> showSaveSheet(
     builder: (sheet) => StatefulBuilder(builder: (sheet, set) {
       final hasPdf = o.formats.contains(SaveFormat.pdf);
       const imageFormats = {SaveFormat.jpg, SaveFormat.png, SaveFormat.longImage};
-      final imagesOnly = o.formats.every(imageFormats.contains);
       final count = o.onlySelected ? selected : total;
+      // ZIP 스위치가 보이는 경우: 파일이 여러 개가 될 때
+      final zipVisible = o.formats.length > 1 ||
+          (count > 1 && (o.formats.contains(SaveFormat.jpg) || o.formats.contains(SaveFormat.png)));
+      // ZIP으로 묶으면 사진이 아니라 파일 하나라서 갤러리가 아니라 저장 창으로 간다
+      final imagesOnly = !(o.zip && zipVisible) && o.formats.every(imageFormats.contains);
       void go(SaveTarget t) {
+        if (!zipVisible) o.zip = false; // 안 보이는 ZIP 설정(지난 설정)이 남아 동작을 바꾸지 않게
         o.name = nameCtl.text.trim().isEmpty ? o.name : nameCtl.text.trim();
         o.password = usePw && pwCtl.text.isNotEmpty ? pwCtl.text : null;
         o.watermark = useWm && wmCtl.text.trim().isNotEmpty ? wmCtl.text.trim() : null;
@@ -236,8 +241,7 @@ Future<(SaveOptions, SaveTarget)?> showSaveSheet(
                           labelText: '암호 (영문·숫자·기호)', prefixIcon: Icon(Icons.lock_outline_rounded)),
                     ),
                 ],
-                if (o.formats.length > 1 ||
-                    (count > 1 && (o.formats.contains(SaveFormat.jpg) || o.formats.contains(SaveFormat.png))))
+                if (zipVisible)
                   SwitchListTile(
                     contentPadding: EdgeInsets.zero,
                     title: const Text('ZIP 하나로 묶기'),
@@ -412,7 +416,7 @@ Future<String?> runSave(List<ScanPage> pages, SaveOptions o, SaveTarget target) 
     if (mime.startsWith('image/')) {
       if (photos == 0 && !await Gal.hasAccess(toAlbum: true)) await Gal.requestAccess(toAlbum: true);
       // JPG·PNG를 같이 저장하면 이름이 겹치지 않게 확장자를 이름에 남긴다
-      final gname = bothImages ? name.replaceAll('.', '_') : name.split('.').first;
+      final gname = bothImages ? name.replaceAll('.', '_') : name.substring(0, name.lastIndexOf('.'));
       await Gal.putImageBytes(bytes, album: 'BookScan', name: gname);
       photos++;
     } else {

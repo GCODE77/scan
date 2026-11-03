@@ -48,10 +48,9 @@ Future<List<ScanPage>> pickAndScan(BuildContext context) async {
     }
     done.value++;
   }
+  if (context.mounted) Navigator.of(context, rootNavigator: true).pop(); // 진행 창 닫기
   done.dispose();
-
   if (!context.mounted) return pages;
-  Navigator.of(context, rootNavigator: true).pop(); // 진행 창 닫기
   if (failed > 0) {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('사진 $failed장을 처리하지 못했습니다')));
   }

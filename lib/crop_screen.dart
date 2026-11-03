@@ -55,6 +55,23 @@ class _CropScreenState extends State<CropScreen> {
   /// 끌기 시작한 위치 (원래 자리로 되끌려가지 않게)
   Offset? _dragFrom;
 
+  // ── 확대·이동 (두 손가락) ──
+  double _zoom = 1;
+  Offset _pan = Offset.zero; // 확대한 화면의 이동량
+  double _zStart = 1;
+  Offset _tStart = Offset.zero, _focalStart = Offset.zero, _grabPoint = Offset.zero;
+
+  /// 두 손가락을 댄 동안과 그 뒤 남은 한 손가락은 점을 잡지 않고 화면만 움직인다
+  bool _multi = false;
+
+  /// 화면에 닿아 있는 손가락 수 (제스처 인식기의 종료 알림에 기대지 않고 직접 센다)
+  int _pointers = 0;
+
+  void _pointerGone() {
+    if (_pointers > 0) _pointers--;
+    if (_pointers == 0) _multi = false;
+  }
+
   /// 놓은 모서리를 근처의 실제 종이 모서리에 붙인다. 선들은 함께 따라온다.
   Future<void> _snap(int handle) async {
     final corner = _cornerOf[handle];
@@ -106,6 +123,7 @@ class _CropScreenState extends State<CropScreen> {
   Future<void> _snapEdges(Set<int> edges) async {
     if (!_magnetOn) return;
     final seq = ++_snapSeq;
+    final spread = _shape.spread; // 계산하는 동안 양면/한 장이 바뀌면 점 개수가 달라진다
     final quad = [_shape.top.first, _shape.top.last, _shape.bottom.last, _shape.bottom.first];
     // 변 위의 점들: 위·아래는 조절점(모서리·제본선 제외), 좌우는 곡선 위 세 지점
     List<Offset> pointsOf(int e) {
@@ -123,7 +141,7 @@ class _CropScreenState extends State<CropScreen> {
     final results = await Future.wait([
       for (final e in edges) compute(snapEdgePoints, (_jpg, quad, e, pointsOf(e))),
     ]);
-    if (!mounted || seq != _snapSeq || _dragging != null) return;
+    if (!mounted || seq != _snapSeq || _dragging != null || _shape.spread != spread) return;
     setState(() {
       var i = 0;
       for (final e in edges) {
@@ -228,8 +246,11 @@ class _CropScreenState extends State<CropScreen> {
 
 
   /// 굴곡을 없애고 네 모서리 사이를 곧은 선으로
-  void _straighten() => setState(() => _shape = PageShape.quad(
-      [_shape.top.first, _shape.top.last, _shape.bottom.last, _shape.bottom.first], _shape.spread));
+  void _straighten() => setState(() {
+        _snapSeq++;
+        _shape = PageShape.quad(
+            [_shape.top.first, _shape.top.last, _shape.bottom.last, _shape.bottom.first], _shape.spread);
+      });
 
   @override
   Widget build(BuildContext context) {
@@ -263,61 +284,123 @@ class _CropScreenState extends State<CropScreen> {
                 final s = (box.maxWidth / d.width).clamp(0.0, box.maxHeight / d.height);
                 final ox = (box.maxWidth - d.width * s) / 2;
                 final oy = (box.maxHeight - d.height * s) / 2;
-                Offset toScreen(Offset p) => Offset(ox + p.dx * s, oy + p.dy * s);
-                Offset toImage(Offset p) => Offset(
-                      ((p.dx - ox) / s).clamp(0, d.width.toDouble()),
-                      ((p.dy - oy) / s).clamp(0, d.height.toDouble()),
-                    );
+                final z = _zoom, t = _pan;
+                // 사진 좌표 ↔ 화면 좌표 (확대·이동 반영)
+                Offset toScreen(Offset p) => Offset(ox + p.dx * s, oy + p.dy * s) * z + t;
+                Offset clampPan(Offset v, double zoom) => Offset(
+                    v.dx.clamp(box.maxWidth * (1 - zoom), 0.0), v.dy.clamp(box.maxHeight * (1 - zoom), 0.0));
                 final top = _shape.top.map(toScreen).toList();
                 final bottom = _shape.bottom.map(toScreen).toList();
                 // 변 휨은 방향·크기 벡터라서 배율만 곱한다
                 final screenShape = PageShape(top, bottom, _shape.spread,
-                    leftBow: _shape.leftBow * s, rightBow: _shape.rightBow * s);
+                    leftBow: _shape.leftBow * s * z, rightBow: _shape.rightBow * s * z);
                 final handles = [...top, ...bottom, toScreen(_sideMid(true)), toScreen(_sideMid(false))];
 
-                return GestureDetector(
-                  onPanStart: (e) {
+                return Listener(
+                  behavior: HitTestBehavior.translucent,
+                  onPointerDown: (_) => _pointers++,
+                  onPointerUp: (_) => _pointerGone(),
+                  onPointerCancel: (_) => _pointerGone(),
+                  child: GestureDetector(
+                  onScaleStart: (e) {
                     _snapSeq++;
                     _dragFrom = null;
+                    _dragging = null;
+                    _zStart = _zoom;
+                    _tStart = _pan;
+                    _focalStart = e.localFocalPoint;
+                    if (e.pointerCount >= 2) {
+                      _multi = true;
+                      return;
+                    }
+                    if (_multi) return;
                     // 손가락에서 가장 가까운 조절점을 잡는다
                     int? best;
                     for (final i in _visible) {
                       if (best == null ||
-                          (handles[i] - e.localPosition).distance < (handles[best] - e.localPosition).distance) {
+                          (handles[i] - e.localFocalPoint).distance < (handles[best] - e.localFocalPoint).distance) {
                         best = i;
                       }
                     }
-                    if (best != null && (handles[best] - e.localPosition).distance < 56) {
-                      _dragging = best;
+                    if (best != null && (handles[best] - e.localFocalPoint).distance < 56) {
+                      setState(() => _dragging = best);
                       _dragFrom = _point(best);
+                      _grabPoint = _point(best);
                     }
                   },
-                  onPanUpdate: (e) {
+                  onScaleUpdate: (e) {
+                    if (e.pointerCount >= 2) {
+                      // 두 손가락: 확대·이동. 두 손가락 가운데 아래의 그림이 그 자리에 머물게
+                      _multi = true;
+                      final nz = (_zStart * e.scale).clamp(1.0, 10.0);
+                      final base = (_focalStart - _tStart) / _zStart;
+                      setState(() {
+                        _dragging = null;
+                        _zoom = nz;
+                        _pan = clampPan(e.localFocalPoint - base * nz, nz);
+                      });
+                      return;
+                    }
                     final i = _dragging;
-                    if (i == null) return;
-                    setState(() => _setPoint(i, toImage(e.localPosition)));
+                    if (i != null) {
+                      // 손가락이 움직인 만큼만 점을 옮긴다: 점이 손가락 밑으로 튀지 않아 정밀하게 맞출 수 있다
+                      final np = _grabPoint + (e.localFocalPoint - _focalStart) / (s * _zoom);
+                      setState(() => _setPoint(
+                          i, Offset(np.dx.clamp(0, d.width.toDouble()), np.dy.clamp(0, d.height.toDouble()))));
+                    } else if (_zoom > 1) {
+                      // 확대한 상태에서 빈 곳을 한 손가락으로 끌면 화면 이동
+                      setState(() => _pan = clampPan(_tStart + (e.localFocalPoint - _focalStart), _zoom));
+                    }
                   },
-                  onPanEnd: (_) {
+                  onScaleEnd: (e) {
                     final i = _dragging;
-                    setState(() => _dragging = null);
-                    if (i != null) _afterDrop(i);
+                    if (i != null) {
+                      setState(() => _dragging = null);
+                      // 손가락이 모두 떨어졌을 때만 '놓았다'로 본다 (두 번째 손가락이 닿아 끝난 것이면 자석을 쓰지 않는다)
+                      if (e.pointerCount == 0) _afterDrop(i);
+                    }
                   },
                   child: Stack(children: [
-                    Positioned(
-                      left: ox,
-                      top: oy,
-                      width: d.width * s,
-                      height: d.height * s,
-                      child: Image.memory(_jpg, fit: BoxFit.fill, gaplessPlayback: true),
+                    Positioned.fill(
+                      child: ClipRect(
+                        child: Transform(
+                          alignment: Alignment.topLeft,
+                          transform: Matrix4(z, 0, 0, 0, 0, z, 0, 0, 0, 0, 1, 0, t.dx, t.dy, 0, 1),
+                          child: Stack(children: [
+                            Positioned(
+                              left: ox,
+                              top: oy,
+                              width: d.width * s,
+                              height: d.height * s,
+                              child: Image.memory(_jpg, fit: BoxFit.fill, gaplessPlayback: true),
+                            ),
+                          ]),
+                        ),
+                      ),
                     ),
                     Positioned.fill(
-                      child: CustomPaint(
-                          painter: _ShapePainter(screenShape, handles, _dragging, _snapped)),
+                      child: ClipRect(
+                        child: CustomPaint(painter: _ShapePainter(screenShape, handles, _dragging, _snapped)),
+                      ),
                     ),
                     if (_dragging != null)
                       _Magnifier(
                           image: _jpg, d: d, at: _point(_dragging!), screen: handles[_dragging!], box: box),
+                    if (_zoom > 1.01)
+                      Positioned(
+                        top: 4,
+                        right: 4,
+                        child: ActionChip(
+                          avatar: const Icon(Icons.zoom_out_map_rounded, size: 18),
+                          label: Text('전체 보기 ×${_zoom.toStringAsFixed(1)}'),
+                          onPressed: () => setState(() {
+                            _zoom = 1;
+                            _pan = Offset.zero;
+                          }),
+                        ),
+                      ),
                   ]),
+                  ),
                 );
               }),
             ),
@@ -337,19 +420,25 @@ class _CropScreenState extends State<CropScreen> {
               _QuickTool(
                 icon: Icons.fullscreen_rounded,
                 label: '사진 전체',
-                onTap: () => setState(() => _shape = PageShape.quad([
-                      Offset.zero,
-                      Offset(d.width.toDouble(), 0),
-                      Offset(d.width.toDouble(), d.height.toDouble()),
-                      Offset(0, d.height.toDouble()),
-                    ], false)),
+                onTap: () => setState(() {
+                  _snapSeq++; // 진행 중이던 자석 결과가 새 윤곽을 덮지 않게
+                  _shape = PageShape.quad([
+                    Offset.zero,
+                    Offset(d.width.toDouble(), 0),
+                    Offset(d.width.toDouble(), d.height.toDouble()),
+                    Offset(0, d.height.toDouble()),
+                  ], false);
+                }),
               ),
               _QuickTool(icon: Icons.straighten_rounded, label: '굴곡 없이', onTap: _straighten),
               _QuickTool(
                 icon: _shape.spread ? Icons.menu_book_rounded : Icons.description_outlined,
                 label: _shape.spread ? '양면 → 2장' : '한 장',
                 active: _shape.spread,
-                onTap: () => setState(() => _shape = _shape.copy(spread: !_shape.spread)),
+                onTap: () => setState(() {
+                  _snapSeq++;
+                  _shape = _shape.copy(spread: !_shape.spread);
+                }),
               ),
             ]),
           ),
@@ -397,7 +486,7 @@ class _ShapePainter extends CustomPainter {
     final line = Paint()
       ..color = Colors.lightBlueAccent
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 2.5;
+      ..strokeWidth = 2;
     canvas.drawPath(path, line);
     // 펴질 모양을 짐작할 수 있게 가로 안내선 (좌우 변이 휘면 같이 휜다)
     final guide = Paint()
@@ -422,9 +511,9 @@ class _ShapePainter extends CustomPainter {
       if (!_CropScreenState._visible.contains(i)) continue;
       final corner = i == 0 || i == kPts - 1 || i == kPts || i == 2 * kPts - 1;
       final spine = spread && (i == kMid || i == kPts + kMid);
-      final r = i == active ? 17.0 : (corner ? 13.0 : 11.0);
+      final r = i == active ? 10.0 : (corner ? 7.0 : 6.0); // 점이 작아야 종이 끝이 가려지지 않는다
       if (i == snapped) {
-        canvas.drawCircle(pts[i], r + 9,
+        canvas.drawCircle(pts[i], r + 6,
             Paint()
               ..color = const Color(0xFF4FE3C1)
               ..style = PaintingStyle.stroke
@@ -433,7 +522,7 @@ class _ShapePainter extends CustomPainter {
       canvas.drawCircle(pts[i], r, Paint()..color = Colors.white);
       canvas.drawCircle(
           pts[i],
-          r - 3,
+          r - 2,
           Paint()
             ..color = spine
                 ? Colors.orangeAccent

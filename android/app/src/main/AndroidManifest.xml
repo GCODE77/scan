@@ -34,6 +34,10 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+        <!-- ML Kit 배경 제거 모델을 구글 플레이 서비스가 미리 내려받도록 요청 -->
+        <meta-data
+            android:name="com.google.mlkit.vision.DEPENDENCIES"
+            android:value="subject_segment" />
         <!-- 앱 안 업데이트: 설치 결과(성공/실패)를 받는다 -->
         <receiver android:name="sk.fourq.otaupdate.InstallResultReceiver" android:exported="false">
             <intent-filter>

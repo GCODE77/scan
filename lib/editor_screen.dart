@@ -34,6 +34,9 @@ class _EditorScreenState extends State<EditorScreen> {
   bool _busy = false;
   bool _compare = false;
 
+  /// 지금 페이지가 확대돼 있는지 (확대 중에는 옆으로 밀어도 페이지가 넘어가지 않게)
+  bool _zoomed = false;
+
   /// 필터 미리보기 썸네일 캐시 (편 이미지별)
   final _thumbs = Expando<Future<Map<ScanMode, Uint8List>>>();
 
@@ -77,8 +80,8 @@ class _EditorScreenState extends State<EditorScreen> {
 
   void _setFilter(ScanMode m, {bool all = false}) => _work(() async {
         _push();
-        for (final p in all ? _pages : [_page]) {
-          if (p.mode == m) continue;
+        for (final p in List.of(all ? _pages : [_page])) {
+          if (!_pages.contains(p) || p.mode == m) continue;
           p.mode = m;
           p.strength = 1; // 새 필터는 최대 강도부터
           await p.render();
@@ -107,7 +110,7 @@ class _EditorScreenState extends State<EditorScreen> {
     if (p.cleaned) {
       if (p.rawFlat == null) {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-            content: Text('되돌리려면 "자르기" → "이대로 펴기"로 다시 펴 주세요')));
+            content: Text('되돌리려면 위쪽 되돌리기 버튼을 누르거나 "윤곽 수정" → "이대로 펴기"로 다시 펴 주세요')));
         return;
       }
       await _work(() async {
@@ -139,10 +142,12 @@ class _EditorScreenState extends State<EditorScreen> {
     var changed = 0;
     await _work(() async {
       _push();
-      for (final p in all ? _pages : [_page]) {
+      for (final p in List.of(all ? _pages : [_page])) {
+        if (!_pages.contains(p)) continue; // 작업 중에 지워진 페이지
         final (bytes, amount) = await job(p.flat);
         if (amount == 0) continue;
         p.flat = bytes;
+        p.rawFlat = null; // 정리 취소용 원본은 이 보정과 어긋나므로 버린다 (되돌리기 버튼으로 취소)
         // 이미지를 돌렸으면 배경 제거 마스크도 같은 각도로
         if (rotates && p.cutMask != null) p.cutMask = await compute(rotateMask, (p.cutMask!, amount));
         await p.render();
@@ -224,7 +229,33 @@ class _EditorScreenState extends State<EditorScreen> {
     _toast('$note · 되돌리기로 취소');
   }
 
-  /// AI 배경 제거(기기 안에서 처리). 이미 제거한 페이지를 누르면 되돌린다. 길게 누르면 모든 페이지.
+  /// ML Kit 배경 인식. 처음에는 구글 플레이 서비스가 모델을 내려받는 중일 수 있어, 그동안 기다리며 다시 시도한다.
+  /// 대상 확신도(0~1)를 돌려주고, 쓸 수 없으면 null.
+  Future<List<double>?> _segment(SubjectSegmenter seg, String path) async {
+    var told = false;
+    for (var attempt = 0; attempt < 8; attempt++) {
+      try {
+        return (await seg.processImage(InputImage.fromFilePath(path))).foregroundConfidenceMask;
+      } on PlatformException catch (e) {
+        final msg = '${e.message}'.toLowerCase();
+        debugPrint('배경 인식 오류: ${e.code} / ${e.message}');
+        // 모델을 내려받는 중이면 잠시 뒤 다시, 그 밖의 오류는 대체 방식으로
+        if (!(msg.contains('download') || msg.contains('waiting'))) return null;
+        if (!told) {
+          told = true;
+          _toast('배경 인식 모델을 내려받는 중이에요 (처음 한 번만, 잠시만요)');
+        }
+        await Future.delayed(const Duration(seconds: 4));
+      } catch (e) {
+        debugPrint('배경 인식 실패: $e');
+        return null;
+      }
+    }
+    return null;
+  }
+
+  /// 배경 제거(기기 안에서 처리). 이미 제거한 페이지를 누르면 되돌린다. 길게 누르면 모든 페이지.
+  /// AI(ML Kit)를 쓸 수 없으면 기본 방식(GrabCut)으로 대신한다.
   Future<void> _removeBg({bool all = false}) async {
     if (!all && _page.cutMask != null) {
       await _work(() async {
@@ -237,42 +268,57 @@ class _EditorScreenState extends State<EditorScreen> {
     }
     final targets = all ? _pages.where((p) => p.cutMask == null).toList() : [_page];
     if (targets.isEmpty) return;
-    final seg = SubjectSegmenter(
-        options: SubjectSegmenterOptions(
-            enableForegroundBitmap: false,
-            enableForegroundConfidenceMask: true,
-            enableMultipleSubjects: SubjectResultOptions(enableConfidenceMask: false, enableSubjectBitmap: false)));
-    var done = 0;
-    String? err;
+    var done = 0, fallback = 0;
     await _work(() async {
       _push();
       final dir = await getTemporaryDirectory();
+      final seg = SubjectSegmenter(
+          options: SubjectSegmenterOptions(
+              enableForegroundBitmap: false,
+              enableForegroundConfidenceMask: true,
+              enableMultipleSubjects:
+                  SubjectResultOptions(enableConfidenceMask: false, enableSubjectBitmap: false)));
+      var aiOk = true; // 한 번 쓸 수 없으면 이번 작업에서는 더 시도하지 않는다
       try {
         for (final p in targets) {
-          final (small, w, h, fw, fh) = await compute(prepSegment, p.flat);
-          final f = await File('${dir.path}/seg_${p.id}.jpg').writeAsBytes(small);
-          final res = await seg.processImage(InputImage.fromFilePath(f.path));
-          f.delete().ignore();
-          final conf = res.foregroundConfidenceMask;
-          if (conf == null || conf.length != w * h) {
-            err = '배경을 인식하지 못했어요';
-            continue;
+          Uint8List? mask;
+          if (aiOk) {
+            final (small, w, h, fw, fh) = await compute(prepSegment, p.flat);
+            final f = await File('${dir.path}/seg_${p.id}.jpg').writeAsBytes(small);
+            final conf = await _segment(seg, f.path);
+            f.delete().ignore();
+            if (conf == null || conf.length != w * h) {
+              aiOk = false;
+            } else if (conf.where((v) => v > 0.5).length >= conf.length * 0.03) {
+              mask = await compute(buildCutMask, (conf, w, h, fw, fh));
+            } // 대상을 못 찾았으면(3% 미만) 이 페이지만 기본 방식으로
           }
-          p.cutMask = await compute(buildCutMask, (conf, w, h, fw, fh));
+          if (mask == null) {
+            final gc = await compute(grabCutMask, p.flat);
+            if (gc.isEmpty) continue; // 대상을 못 찾았다: 이 페이지는 그대로 둔다 (흰 페이지가 되지 않게)
+            mask = gc;
+            fallback++;
+          }
+          p.cutMask = mask;
           await p.render();
           done++;
         }
       } catch (e) {
-        err = '배경 제거에 실패했어요 (처음 한 번은 인터넷 연결이 필요할 수 있어요)\n$e';
         debugPrint('배경 제거 실패: $e');
       } finally {
-        await seg.close();
+        try {
+          await seg.close();
+        } catch (_) {}
       }
       if (done == 0 && _history.isNotEmpty) _history.removeLast();
     });
-    _toast(done > 0
-        ? '배경을 지웠어요${all ? ' ($done페이지)' : ''} · PNG로 저장하면 투명 배경 · 되돌리기로 취소'
-        : (err ?? '배경을 지우지 못했어요'));
+    if (done == 0) {
+      _toast('배경을 지우지 못했어요. 대상이 사진 가운데 크게 보이게 윤곽을 맞춘 뒤 다시 해 보세요');
+    } else {
+      _toast('${all ? '배경을 지웠어요 ($done페이지)' : '배경을 지웠어요'}'
+          '${fallback > 0 ? ' · AI 모델을 쓰지 못해 기본 방식으로 처리했어요(단순한 배경에서 잘 돼요)' : ''}'
+          ' · PNG로 저장하면 투명 배경 · 되돌리기로 취소');
+    }
   }
 
   /// 서명 넣기 (이미 있으면 추가/모두 지우기 선택)
@@ -413,6 +459,7 @@ class _EditorScreenState extends State<EditorScreen> {
   }
 
   void _delete() {
+    if (_busy) return; // 다른 작업이 이 페이지들을 쓰는 중
     if (_pages.length > 1) _push(); // 마지막 페이지를 지우면 화면이 닫힌다
     setState(() {
       _pages.removeAt(_index);
@@ -488,28 +535,37 @@ class _EditorScreenState extends State<EditorScreen> {
             PageView.builder(
               controller: _pager,
               itemCount: _pages.length,
-              onPageChanged: (i) => setState(() => _index = i),
+              physics: _zoomed ? const NeverScrollableScrollPhysics() : null,
+              onPageChanged: (i) => setState(() {
+                _index = i;
+                _zoomed = false;
+              }),
               itemBuilder: (_, i) => Padding(
                 padding: const EdgeInsets.fromLTRB(24, 8, 24, 8),
-                child: Center(
-                  child: Stack(children: [
-                    Image.memory(
-                        _compare && i == _index ? _pages[i].flat : _pages[i].jpg,
-                        gaplessPlayback: true),
-                    Positioned(
-                      left: 8,
-                      top: 8,
-                      child: Material(
-                        color: Colors.black45,
-                        shape: const CircleBorder(),
-                        child: IconButton(
-                          icon: const Icon(Icons.delete_outline, color: Colors.white),
-                          onPressed: _delete,
-                        ),
+                child: Stack(children: [
+                  // 두 손가락으로 확대·이동, 두 번 누르면 확대/원래대로
+                  Positioned.fill(
+                    child: _ZoomPage(
+                      key: ObjectKey(_pages[i]),
+                      image: _compare && i == _index ? _pages[i].flat : _pages[i].jpg,
+                      onZoom: (z) {
+                        if (mounted && i == _index && z != _zoomed) setState(() => _zoomed = z);
+                      },
+                    ),
+                  ),
+                  Positioned(
+                    left: 8,
+                    top: 8,
+                    child: Material(
+                      color: Colors.black45,
+                      shape: const CircleBorder(),
+                      child: IconButton(
+                        icon: const Icon(Icons.delete_outline, color: Colors.white),
+                        onPressed: _delete,
                       ),
                     ),
-                  ]),
-                ),
+                  ),
+                ]),
               ),
             ),
             // 인식된 영역: 원본 사진 위 윤곽선. 누르면 바로 수정
@@ -893,5 +949,68 @@ class _Snapshot {
         ..clear()
         ..addAll(s.stamps);
     }
+  }
+}
+
+/// 페이지 이미지 하나: 두 손가락으로 확대·이동(최대 6배), 두 번 누르면 확대/원래대로.
+class _ZoomPage extends StatefulWidget {
+  const _ZoomPage({super.key, required this.image, required this.onZoom});
+
+  final Uint8List image;
+
+  /// 확대 중인지 알린다 (확대 중에는 페이지 넘기기를 막는다)
+  final ValueChanged<bool> onZoom;
+
+  @override
+  State<_ZoomPage> createState() => _ZoomPageState();
+}
+
+class _ZoomPageState extends State<_ZoomPage> {
+  final _tc = TransformationController();
+  bool _zoomed = false;
+  Offset _tap = Offset.zero;
+
+  @override
+  void initState() {
+    super.initState();
+    _tc.addListener(() {
+      final z = _tc.value.getMaxScaleOnAxis() > 1.02;
+      if (z != _zoomed) {
+        _zoomed = z;
+        widget.onZoom(z);
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    // 확대한 채로 이 페이지가 바뀌면(다시 펴기·되돌리기·삭제) 확대 상태를 풀어 준다
+    final cb = widget.onZoom;
+    if (_zoomed) WidgetsBinding.instance.addPostFrameCallback((_) => cb(false));
+    _tc.dispose();
+    super.dispose();
+  }
+
+  void _doubleTap() {
+    if (_zoomed) {
+      _tc.value = Matrix4.identity();
+    } else {
+      const k = 2.5; // 누른 곳을 중심으로 2.5배
+      _tc.value = Matrix4(k, 0, 0, 0, 0, k, 0, 0, 0, 0, 1, 0, -_tap.dx * (k - 1), -_tap.dy * (k - 1), 0, 1);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onDoubleTapDown: (d) => _tap = d.localPosition,
+      onDoubleTap: _doubleTap,
+      child: InteractiveViewer(
+        transformationController: _tc,
+        minScale: 1,
+        maxScale: 6,
+        child: Center(child: Image.memory(widget.image, gaplessPlayback: true)),
+      ),
+    );
   }
 }
