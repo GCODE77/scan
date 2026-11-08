@@ -5,12 +5,16 @@ import 'package:flutter/material.dart';
 import 'package:ota_update/ota_update.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'theme.dart';
 
 const kCopyright = '© 2026 GLORY KIM. All rights reserved.';
 const _releasesPage = 'https://github.com/GCODE77/scan/releases/latest';
+
+/// 다른 사람에게 알려 줄 앱 받는 곳
+const kAppLink = _releasesPage;
 
 /// 새 버전 정보
 class Release {
@@ -26,6 +30,25 @@ class Updater {
   static const _api = 'https://api.github.com/repos/GCODE77/scan/releases/latest';
 
   static Future<String> currentVersion() async => (await PackageInfo.fromPlatform()).version;
+
+  /// 이 앱을 다른 사람에게 소개하고 받을 곳(GitHub 최신 릴리스)을 보낸다. 카카오톡·문자·메일 등 공유 창이 열린다.
+  static Future<void> shareApp() async {
+    final v = await currentVersion();
+    await SharePlus.instance.share(ShareParams(
+      subject: '북스캔 앱 소개',
+      text: '북스캔 v$v — 휴대폰으로 책·문서 스캔\n'
+          '\n'
+          '책이나 서류를 찍으면 스캐너로 스캔한 것처럼 반듯하게 펴 주는 안드로이드 앱이에요.\n'
+          '• 연속 촬영, 굴곡·양면 자동 펴기, 윤곽 수정(확대·자석)\n'
+          '• 한국어·영어 글자 인식(OCR), 검색되는 PDF\n'
+          '• PDF·JPG·PNG·TXT·워드·긴 사진으로 한 번에 저장·공유\n'
+          '• 빛반사·그림자·기울기 보정, 배경 제거, 영역 자르기\n'
+          '• 모든 처리는 폰 안에서 (오프라인), 새 버전은 앱이 알려 줘요\n'
+          '\n'
+          '받기: $kAppLink\n'
+          '(설치할 때 "출처를 알 수 없는 앱 설치 허용"이 필요해요)',
+    ));
+  }
 
   /// GitHub 최신 릴리스 (확인 실패면 null)
   static Future<Release?> latest() async {
@@ -167,6 +190,11 @@ class Updater {
         ]),
         actions: [
           TextButton(onPressed: () => Navigator.pop(d), child: const Text('닫기')),
+          OutlinedButton.icon(
+            icon: const Icon(Icons.ios_share_rounded, size: 20),
+            label: const Text('앱 공유'),
+            onPressed: shareApp,
+          ),
           FilledButton.icon(
             icon: const Icon(Icons.system_update_rounded, size: 20),
             label: const Text('업데이트 확인'),

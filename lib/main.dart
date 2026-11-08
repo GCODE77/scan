@@ -357,11 +357,18 @@ class _LibraryScreenState extends State<LibraryScreen> {
               onPressed: () => setState(() => _selectMode = true),
             ),
           PopupMenuButton<String>(
-            onSelected: (v) => v == 'storage' ? _storage() : Updater.showAbout(context),
+            onSelected: (v) => switch (v) {
+              'storage' => _storage(),
+              'share' => Updater.shareApp(),
+              _ => Updater.showAbout(context),
+            },
             itemBuilder: (_) => const [
               PopupMenuItem(
                   value: 'storage',
                   child: ListTile(leading: Icon(Icons.sd_storage_rounded), title: Text('저장 공간'))),
+              PopupMenuItem(
+                  value: 'share',
+                  child: ListTile(leading: Icon(Icons.ios_share_rounded), title: Text('앱 공유하기'))),
               PopupMenuItem(
                   value: 'about',
                   child: ListTile(leading: Icon(Icons.info_outline_rounded), title: Text('앱 정보·업데이트'))),
