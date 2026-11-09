@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:archive/archive.dart';
 import 'package:file_picker/file_picker.dart';
@@ -95,7 +96,8 @@ class _SavePrefs {
 
 /// 저장 옵션 시트. 고른 옵션과 저장 방법을 돌려준다.
 Future<(SaveOptions, SaveTarget)?> showSaveSheet(
-    BuildContext context, int total, int selected, String docName) async {
+    BuildContext context, List<ScanPage> pages, Set<ScanPage> selectedPages, String docName) async {
+  final total = pages.length, selected = selectedPages.length;
   final o = SaveOptions()
     // 파일 이름에 쓸 수 없는 글자는 바꾼다
     ..name = docName.replaceAll(RegExp(r'[\/:*?"<>|]'), '-').replaceAll(' ', '_')
@@ -106,11 +108,23 @@ Future<(SaveOptions, SaveTarget)?> showSaveSheet(
   final pwCtl = TextEditingController(), wmCtl = TextEditingController(text: '사본');
   var usePw = false, useWm = false;
 
+  // 예상 용량: 가운데쯤 크기의 페이지 한 장을 화질 단계마다 실제로 인코딩해 보고 전체로 늘린다 (시트는 바로 열린다)
+  final probe = ValueNotifier<Map<String, int>?>(null);
+  if (pages.isNotEmpty) {
+    final bySize = [...pages]..sort((a, b) => a.jpg.length.compareTo(b.jpg.length));
+    compute(probeSizes, (
+      bySize[bySize.length ~/ 2].jpg,
+      [for (final q in SaveQuality.values) (_qualityInfo[q]!.$2, _qualityInfo[q]!.$3)],
+    )).then((m) => probe.value = m, onError: (_) {});
+  }
+
   return showModalBottomSheet<(SaveOptions, SaveTarget)>(
     context: context,
     isScrollControlled: true,
     backgroundColor: Colors.transparent,
-    builder: (sheet) => StatefulBuilder(builder: (sheet, set) {
+    builder: (sheet) => ValueListenableBuilder<Map<String, int>?>(
+        valueListenable: probe,
+        builder: (_, pr, _) => StatefulBuilder(builder: (sheet, set) {
       final hasPdf = o.formats.contains(SaveFormat.pdf);
       const imageFormats = {SaveFormat.jpg, SaveFormat.png, SaveFormat.longImage};
       final count = o.onlySelected ? selected : total;
@@ -119,6 +133,29 @@ Future<(SaveOptions, SaveTarget)?> showSaveSheet(
           (count > 1 && (o.formats.contains(SaveFormat.jpg) || o.formats.contains(SaveFormat.png)));
       // ZIP으로 묶으면 사진이 아니라 파일 하나라서 갤러리가 아니라 저장 창으로 간다
       final imagesOnly = !(o.zip && zipVisible) && o.formats.every(imageFormats.contains);
+
+      // ── 예상 용량 ──
+      final targets = o.onlySelected && selected > 0 ? [for (final p in pages) if (selectedPages.contains(p)) p] : pages;
+      final est = _SizeEstimate(pr, targets, o);
+      final ocrPending = targets.any((p) => p.ocr == null);
+      String sizeLabel(SaveFormat f) {
+        final b = est.bytes(f, o.quality);
+        if (b == null) return '계산 중…';
+        // 글자 인식이 덜 끝났으면 TXT·DOCX는 더 커질 수 있다
+        final more = ocrPending && (f == SaveFormat.txt || f == SaveFormat.docx);
+        return '약 ${_fmtSize(b)}${more ? '+' : ''}';
+      }
+
+      /// 이 화질로 고른 형식을 모두 저장할 때의 합계
+      int? totalAt(SaveQuality q) {
+        var sum = 0;
+        for (final f in o.formats) {
+          final b = est.bytes(f, q);
+          if (b == null) return null;
+          sum += b;
+        }
+        return sum;
+      }
       void go(SaveTarget t) {
         if (!zipVisible) o.zip = false; // 안 보이는 ZIP 설정(지난 설정)이 남아 동작을 바꾸지 않게
         o.name = nameCtl.text.trim().isEmpty ? o.name : nameCtl.text.trim();
@@ -165,6 +202,7 @@ Future<(SaveOptions, SaveTarget)?> showSaveSheet(
                       width: (MediaQuery.of(sheet).size.width - 44 - 16) / 3,
                       child: _FormatCard(
                         info: _formatInfo[f]!,
+                        size: sizeLabel(f),
                         selected: o.formats.contains(f),
                         // 마지막 하나는 끌 수 없다
                         onTap: () => set(() {
@@ -173,6 +211,17 @@ Future<(SaveOptions, SaveTarget)?> showSaveSheet(
                       ),
                     ),
                 ]),
+                Padding(
+                  padding: const EdgeInsets.only(top: 10),
+                  child: Builder(builder: (_) {
+                    final t = totalAt(o.quality);
+                    return Text(
+                        t == null
+                            ? '예상 용량 계산 중…'
+                            : '${o.formats.length}개 형식 합계 약 ${_fmtSize(t)}${o.zip && zipVisible ? ' (ZIP으로 묶으면 조금 더 작아져요)' : ''}',
+                        style: const TextStyle(color: AppColors.accent, fontSize: 13, fontWeight: FontWeight.w700));
+                  }),
+                ),
                 if (o.formats.any((f) => f != SaveFormat.txt && f != SaveFormat.docx)) ...[
                   const SizedBox(height: 22),
                   const _Label('화질'),
@@ -180,7 +229,14 @@ Future<(SaveOptions, SaveTarget)?> showSaveSheet(
                     showSelectedIcon: false,
                     segments: [
                       for (final q in SaveQuality.values)
-                        ButtonSegment(value: q, label: Text(_qualityInfo[q]!.$1)),
+                        ButtonSegment(
+                          value: q,
+                          label: Column(mainAxisSize: MainAxisSize.min, children: [
+                            Text(_qualityInfo[q]!.$1),
+                            Text(totalAt(q) == null ? '…' : '약 ${_fmtSize(totalAt(q)!)}',
+                                style: const TextStyle(fontSize: 10.5, color: AppColors.muted)),
+                          ]),
+                        ),
                     ],
                     selected: {o.quality},
                     onSelectionChanged: (v) => set(() => o.quality = v.first),
@@ -290,7 +346,7 @@ Future<(SaveOptions, SaveTarget)?> showSaveSheet(
           ),
         ),
       );
-    }),
+    })),
   );
 }
 
@@ -309,9 +365,12 @@ class _Label extends StatelessWidget {
 }
 
 class _FormatCard extends StatelessWidget {
-  const _FormatCard({required this.info, required this.selected, required this.onTap});
+  const _FormatCard({required this.info, required this.selected, required this.onTap, this.size});
 
   final (IconData, String, String) info;
+
+  /// 예상 용량 (예: '약 3.2 MB')
+  final String? size;
   final bool selected;
   final VoidCallback onTap;
 
@@ -333,6 +392,12 @@ class _FormatCard extends StatelessWidget {
           Text(info.$2, style: const TextStyle(fontWeight: FontWeight.w700)),
           const SizedBox(height: 2),
           Text(info.$3, style: const TextStyle(color: AppColors.muted, fontSize: 10.5)),
+          if (size != null) ...[
+            const SizedBox(height: 4),
+            Text(size!,
+                style: TextStyle(
+                    color: selected ? AppColors.accent : Colors.white70, fontSize: 12, fontWeight: FontWeight.w700)),
+          ],
         ]),
       ),
     );
@@ -354,11 +419,7 @@ Future<String?> runSave(List<ScanPage> pages, SaveOptions o, SaveTarget target) 
         outs.add(('${o.name}.pdf', await _buildPdf(pages, o, maxSide, quality), 'application/pdf'));
 
       case SaveFormat.txt:
-        final text = [
-          for (var i = 0; i < pages.length; i++) '── ${i + 1}페이지 ──\n${pages[i].ocr?.text ?? ''}',
-        ].join('\n\n');
-        // BOM을 붙여야 윈도우 메모장에서도 한글이 깨지지 않는다
-        outs.add(('${o.name}.txt', Uint8List.fromList([0xEF, 0xBB, 0xBF, ...utf8.encode(text)]), 'text/plain'));
+        outs.add(('${o.name}.txt', _txtBytes(pages), 'text/plain'));
 
       case SaveFormat.docx:
         outs.add((
@@ -429,6 +490,116 @@ Future<String?> runSave(List<ScanPage> pages, SaveOptions o, SaveTarget target) 
     if (photos > 0) '사진 $photos장(갤러리 BookScan 앨범)',
   ];
   return parts.isEmpty ? null : '${parts.join(' + ')} 저장 완료';
+}
+
+/// TXT 파일 내용. BOM을 붙여야 윈도우 메모장에서도 한글이 깨지지 않는다.
+Uint8List _txtBytes(List<ScanPage> pages) {
+  final text = [
+    for (var i = 0; i < pages.length; i++) '── ${i + 1}페이지 ──\n${pages[i].ocr?.text ?? ''}',
+  ].join('\n\n');
+  return Uint8List.fromList([0xEF, 0xBB, 0xBF, ...utf8.encode(text)]);
+}
+
+/// 파일 크기를 사람이 읽기 쉽게 (KB·MB)
+String _fmtSize(int bytes) {
+  if (bytes < 1024 * 1024) return '${math.max(1, (bytes / 1024).round())} KB';
+  final mb = bytes / (1024 * 1024);
+  return '${mb < 10 ? mb.toStringAsFixed(1) : mb.round()} MB';
+}
+
+/// 저장 용량 어림. TXT·DOCX는 인식된 글자로 정확히, 사진 계열은 [probeSizes]로 잰 한 장을 전체 크기에 비례해 늘린다.
+class _SizeEstimate {
+  const _SizeEstimate(this.probe, this.pages, this.o);
+
+  final Map<String, int>? probe;
+  final List<ScanPage> pages;
+  final SaveOptions o;
+
+  /// 예상 바이트 (아직 계산 중이면 null)
+  int? bytes(SaveFormat f, SaveQuality q) {
+    if (pages.isEmpty) return 0;
+    if (f == SaveFormat.txt) return _txtBytes(pages).length;
+    if (f == SaveFormat.docx) return _buildDocx(pages).length;
+    final pr = probe;
+    if (pr == null) return null;
+    final qi = SaveQuality.values.indexOf(q);
+    final maxSide = _qualityInfo[q]!.$2;
+    // 줄인 뒤의 픽셀 수 (표준·작게는 큰 페이지도 같은 크기로 줄어든다)
+    int outPix(int w, int h) {
+      if (maxSide == null) return w * h;
+      final s = math.min(1.0, maxSide / math.max(w, h));
+      return (w * s).round() * (h * s).round();
+    }
+
+    switch (f) {
+      case SaveFormat.jpg:
+        return _scaled(pr['jpg$qi']!, outPix, pr).round();
+      case SaveFormat.png:
+        return _scaled(pr['png$qi']!, outPix, pr).round();
+      case SaveFormat.pdf:
+        // 사진 + 글자 인식 층·글꼴(부분 내장)은 작다: 약 12KB + 쪽당 1.5KB (실측)
+        final extra = o.searchable ? 12000 + 1500 * pages.length : 4000 + 300 * pages.length;
+        return (_scaled(pr['jpg$qi']!, outPix, pr) + extra).round();
+      case SaveFormat.longImage:
+        // 폭 1200으로 이어 붙이고, 너무 길면 전체 높이 3만 픽셀 안으로 줄인다 (stitchLong과 같다)
+        var sumRatio = 0.0;
+        for (final p in pages) {
+          final d = _jpegSize(p.jpg);
+          sumRatio += d == null ? pr['rows']! / pr['cols']! : d.$2 / d.$1;
+        }
+        final w = math.min(1200.0, 30000 / math.max(sumRatio, 0.01));
+        final shrink = math.min(1.0, (w / 1200) * (w / 1200));
+        return (_scaled(pr['long$qi']!, (pw, ph) => 1200 * (1200 * ph / pw).round(), pr) * shrink).round();
+      case SaveFormat.txt:
+      case SaveFormat.docx:
+        return null; // 위에서 처리
+    }
+  }
+
+  /// 샘플 한 장의 결과 크기([outSample])를 모든 페이지로 늘린다:
+  /// 페이지마다 (줄인 뒤 픽셀 수 비) × (내용 복잡도 = 원본 JPG 바이트/픽셀 비).
+  double _scaled(int outSample, int Function(int w, int h) outPix, Map<String, int> pr) {
+    final sw = pr['cols']!, sh = pr['rows']!, slen = pr['orig']!;
+    final samplePix = outPix(sw, sh), sampleBpp = slen / (sw * sh);
+    var total = 0.0;
+    for (final p in pages) {
+      final d = _jpegSize(p.jpg);
+      if (d == null) {
+        total += outSample * p.jpg.length / slen; // 크기를 읽을 수 없으면 바이트 비례로
+        continue;
+      }
+      final (w, h) = d;
+      total += outSample * (outPix(w, h) / math.max(1, samplePix)) * ((p.jpg.length / (w * h)) / sampleBpp);
+    }
+    return total;
+  }
+}
+
+/// JPEG 헤더에서 (너비, 높이)만 읽는다 (전체를 디코딩하지 않는다). JPEG가 아니면 null.
+(int, int)? _jpegSize(Uint8List b) {
+  if (b.length < 4 || b[0] != 0xFF || b[1] != 0xD8) return null;
+  var i = 2;
+  while (i + 9 < b.length) {
+    if (b[i] != 0xFF) {
+      i++;
+      continue;
+    }
+    final m = b[i + 1];
+    if (m == 0xFF) {
+      i++;
+      continue;
+    }
+    // SOF 표지: 정밀도 1바이트 뒤에 높이·너비(각 2바이트)
+    if (m >= 0xC0 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC) {
+      return ((b[i + 7] << 8) | b[i + 8], (b[i + 5] << 8) | b[i + 6]);
+    }
+    if (m == 0xD8 || (m >= 0xD0 && m <= 0xD7) || m == 0x01) {
+      i += 2;
+      continue;
+    }
+    i += 2 + ((b[i + 2] << 8) | b[i + 3]);
+  }
+  return null;
 }
 
 String _xml(String t) =>

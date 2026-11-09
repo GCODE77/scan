@@ -149,7 +149,7 @@ class _DocumentScreenState extends State<DocumentScreen> {
 
   Future<void> _save() async {
     final messenger = ScaffoldMessenger.of(context);
-    final res = await showSaveSheet(context, _pages.length, _selected.length, widget.doc.name);
+    final res = await showSaveSheet(context, _pages, _selected, widget.doc.name);
     if (res == null) return;
     final (o, target) = res;
     final targets = o.onlySelected && _selected.isNotEmpty

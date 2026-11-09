@@ -2050,3 +2050,44 @@ Future<Uint8List> grabCutMask(Uint8List flat) async {
   m = cv.gaussianBlur(m, (5, 5), 0);
   return cv.imencode('.png', m).$2;
 }
+
+// ───────────────────────── 저장 용량 어림 ─────────────────────────
+
+/// isolate에서 실행된다: 저장 용량 어림용. 페이지 한 장을 화질 단계마다 실제로 인코딩해 크기를 잰다.
+/// (페이지 JPG, [(긴 변 최대 픽셀 또는 null, JPG 화질)]) → {orig, rows, cols, jpgN, pngN, longN} (바이트)
+Future<Map<String, int>> probeSizes((Uint8List, List<(int?, int)>) args) async {
+  final (jpg, qs) = args;
+  final img = cv.imdecode(jpg, cv.IMREAD_COLOR);
+  final out = <String, int>{'orig': jpg.length, 'rows': img.rows, 'cols': img.cols};
+
+  int jpgLen(cv.Mat m, int q) =>
+      cv.imencode('.jpg', m, params: cv.VecI32.fromList([cv.IMWRITE_JPEG_QUALITY, q])).$2.length;
+  // PNG는 오래 걸려서, 원래 해상도 그대로의 작은 조각 3곳(세로 25·50·75%)만 인코딩해 픽셀당 바이트를 재고
+  // 전체 크기로 늘린다 (사진을 줄여서 재면 잡음이 달라져 20%쯤 크게 나온다)
+  int pngLen(cv.Mat m) {
+    final cs = math.min(480, math.min(m.cols, m.rows));
+    var total = 0;
+    for (final f in const [0.25, 0.5, 0.75]) {
+      final y0 = (m.rows * f - cs / 2).round().clamp(0, m.rows - cs);
+      final x0 = ((m.cols - cs) / 2).round();
+      total += cv.imencode('.png', m.region(cv.Rect(x0, y0, cs, cs)).clone()).$2.length;
+    }
+    return (total / (3 * cs * cs) * m.cols * m.rows).round();
+  }
+
+  for (var i = 0; i < qs.length; i++) {
+    final (maxSide, q) = qs[i];
+    var m = img;
+    if (maxSide != null) {
+      final s = maxSide / math.max(img.cols, img.rows);
+      if (s < 1) m = cv.resize(img, ((img.cols * s).round(), (img.rows * s).round()), interpolation: cv.INTER_AREA);
+    }
+    // 고화질 JPG는 원본 JPG를 그대로 쓴다 (runSave와 같다)
+    out['jpg$i'] = maxSide == null ? jpg.length : jpgLen(m, q);
+    out['png$i'] = pngLen(m);
+    // 긴 사진은 폭 1200으로 맞춰 이어 붙인다 (페이지 하나분)
+    final lh = math.max(1, (1200 * img.rows / img.cols).round());
+    out['long$i'] = jpgLen(cv.resize(img, (1200, lh), interpolation: cv.INTER_AREA), q);
+  }
+  return out;
+}
