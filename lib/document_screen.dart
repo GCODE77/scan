@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import 'camera_screen.dart';
+import 'doc_notes_screen.dart';
 import 'gallery_import.dart';
 import 'editor_screen.dart';
 import 'ocr.dart';
@@ -12,9 +13,13 @@ import 'theme.dart';
 /// 문서 하나를 여는 화면: 페이지 목록, 편집, 더 스캔하기, 순서 바꾸기, 저장.
 /// 바뀔 때마다 기기에 자동 보관된다.
 class DocumentScreen extends StatefulWidget {
-  const DocumentScreen({super.key, required this.doc, this.scanFirst = false, this.galleryFirst = false});
+  const DocumentScreen(
+      {super.key, required this.doc, this.scanFirst = false, this.galleryFirst = false, this.knownTags = const []});
 
   final ScanDoc doc;
+
+  /// 보관함 전체에서 쓰는 태그 (태그·메모 화면의 추천)
+  final List<String> knownTags;
 
   /// 새 문서면 바로 촬영부터
   final bool scanFirst;
@@ -66,6 +71,15 @@ class _DocumentScreenState extends State<DocumentScreen> {
   }
 
   void _persist() => Store.save(widget.doc);
+
+  /// 태그·문서 메모·페이지 메모 화면
+  Future<void> _notes() async {
+    await Navigator.push(
+        context, MaterialPageRoute(builder: (_) => DocNotesScreen(doc: widget.doc, knownTags: widget.knownTags)));
+    if (!mounted) return;
+    setState(() {});
+    _persist();
+  }
 
   Future<void> _rename() async {
     final ctl = TextEditingController(text: widget.doc.name);
@@ -149,7 +163,7 @@ class _DocumentScreenState extends State<DocumentScreen> {
 
   Future<void> _save() async {
     final messenger = ScaffoldMessenger.of(context);
-    final res = await showSaveSheet(context, _pages, _selected, widget.doc.name);
+    final res = await showSaveSheet(context, _pages, _selected, widget.doc.name, docMemo: widget.doc.memo);
     if (res == null) return;
     final (o, target) = res;
     final targets = o.onlySelected && _selected.isNotEmpty
@@ -245,6 +259,7 @@ class _DocumentScreenState extends State<DocumentScreen> {
             PopupMenuButton<String>(
               onSelected: (v) {
                 if (v == 'reorder') setState(() => _reorder = true);
+                if (v == 'notes') _notes();
                 if (v == 'delete') _deleteDoc();
               },
               itemBuilder: (_) => [
@@ -252,6 +267,9 @@ class _DocumentScreenState extends State<DocumentScreen> {
                   const PopupMenuItem(
                       value: 'reorder',
                       child: ListTile(leading: Icon(Icons.swap_vert_rounded), title: Text('순서 바꾸기'))),
+                const PopupMenuItem(
+                    value: 'notes',
+                    child: ListTile(leading: Icon(Icons.sticky_note_2_outlined), title: Text('태그·메모'))),
                 const PopupMenuItem(
                     value: 'delete',
                     child: ListTile(
@@ -309,6 +327,22 @@ class _DocumentScreenState extends State<DocumentScreen> {
                     style: const TextStyle(color: AppColors.muted, fontSize: 13),
                   ),
                 ),
+                if (!selecting && (widget.doc.tags.isNotEmpty || widget.doc.memo.isNotEmpty))
+                  InkWell(
+                    onTap: _notes,
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(20, 4, 20, 0),
+                      child: Text(
+                        [
+                          if (widget.doc.tags.isNotEmpty) widget.doc.tags.map((t) => '#$t').join(' '),
+                          if (widget.doc.memo.isNotEmpty) widget.doc.memo.replaceAll(RegExp(r'\s+'), ' '),
+                        ].join(' · '),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(color: AppColors.accent, fontSize: 13),
+                      ),
+                    ),
+                  ),
                 Expanded(
                   child: PageGrid(
                     pages: _pages,

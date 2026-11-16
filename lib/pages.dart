@@ -65,6 +65,11 @@ class PageGrid extends StatelessWidget {
                       Text('${i + 1}',
                           style: const TextStyle(fontWeight: FontWeight.w700, color: Colors.white)),
                       const Spacer(),
+                      if (p.memo.isNotEmpty)
+                        const Padding(
+                          padding: EdgeInsets.only(right: 6),
+                          child: Icon(Icons.sticky_note_2_outlined, size: 14, color: Colors.white70),
+                        ),
                       p.ocr == null
                           ? const SizedBox(
                               width: 10,

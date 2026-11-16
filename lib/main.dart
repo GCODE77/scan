@@ -4,7 +4,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'backup.dart';
+import 'doc_search.dart';
 import 'document_screen.dart';
+import 'ocr.dart';
 import 'pre_update_guard.dart';
 import 'save_sheet.dart';
 import 'storage.dart';
@@ -42,6 +44,154 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   /// 지금 보고 있는 폴더 (null = 전체)
   String? _folder;
+
+  /// 지금 보고 있는 태그 (null = 전체)
+  String? _tag;
+
+  /// 검색어에 맞은 문서와 맞은 곳 (문서 id → 맞은 곳). 검색어나 목록이 바뀔 때만 다시 계산한다.
+  Map<String, SearchHit> _hits = {};
+
+  List<String> get _allTags => allTags([for (final d in _docs ?? <ScanDoc>[]) d.tags]);
+
+  void _recomputeHits() {
+    final terms = searchTerms(_query);
+    _hits = terms.isEmpty
+        ? {}
+        : {
+            for (final d in _docs ?? <ScanDoc>[])
+              if (searchDoc(d.searchDoc, terms) case final h?) d.id: h,
+          };
+  }
+
+  /// 폴더·태그 조건에 맞는 문서 (검색어는 따지지 않음)
+  bool _inView(ScanDoc d) =>
+      (_folder == null || d.folder == _folder) && (_tag == null || hasTag(d.tags, _tag!));
+
+  /// 태그 달기·빼기. 고른 문서들에 한꺼번에 (저장 줄을 거쳐 doc.json 의 태그만 고친다).
+  Future<void> _editTags(List<ScanDoc> docs) async {
+    if (docs.isEmpty) return;
+    final onDocs = allTags([for (final d in docs) d.tags]); // 고른 문서에 붙어 있는 태그
+    final add = <String>{}, remove = <String>{};
+    final ctl = TextEditingController();
+    final ok = await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      builder: (s) => StatefulBuilder(
+        builder: (s, set) => Padding(
+          padding: EdgeInsets.only(bottom: MediaQuery.of(s).viewInsets.bottom),
+          child: SafeArea(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
+              child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(docs.length == 1 ? '태그' : '태그 (문서 ${docs.length}개)',
+                    style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 16)),
+                if (onDocs.isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  const Text('붙어 있는 태그 (눌러서 빼기)', style: TextStyle(color: AppColors.muted)),
+                  const SizedBox(height: 6),
+                  Wrap(spacing: 8, runSpacing: 4, children: [
+                    for (final t in onDocs)
+                      FilterChip(
+                        label: Text('#$t'),
+                        selected: !remove.contains(t),
+                        showCheckmark: false,
+                        onSelected: (_) => set(() => remove.contains(t) ? remove.remove(t) : remove.add(t)),
+                      ),
+                  ]),
+                ],
+                const SizedBox(height: 12),
+                const Text('달 태그', style: TextStyle(color: AppColors.muted)),
+                const SizedBox(height: 6),
+                Wrap(spacing: 8, runSpacing: 4, children: [
+                  for (final t in _allTags.where((t) => !onDocs.any((o) => o.toLowerCase() == t.toLowerCase())))
+                    FilterChip(
+                      label: Text('#$t'),
+                      selected: add.contains(t),
+                      onSelected: (_) => set(() => add.contains(t) ? add.remove(t) : add.add(t)),
+                    ),
+                ]),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: ctl,
+                  decoration: const InputDecoration(
+                      labelText: '새 태그 (쉼표로 여러 개)', prefixIcon: Icon(Icons.sell_outlined)),
+                ),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton(onPressed: () => Navigator.pop(s, true), child: const Text('적용')),
+                ),
+              ]),
+            ),
+          ),
+        ),
+      ),
+    );
+    final typed = parseTagInput(ctl.text);
+    ctl.dispose();
+    if (ok != true || !mounted) return;
+    final addAll = [...add, ...typed];
+    if (addAll.isEmpty && remove.isEmpty) return;
+    for (final d in docs) {
+      await Store.changeTags(d, add: addAll, remove: remove.toList());
+    }
+    _exitSelect();
+    await _refresh();
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('문서 ${docs.length}개의 태그를 바꿨습니다')));
+    }
+  }
+
+  /// 글자 인식이 안 된 페이지를 지금 읽는다 (문서를 하나씩 열어 읽고 저장).
+  Future<void> _recognizeMissing(List<ScanDoc> targets) async {
+    final todo = targets.where((d) => d.ocrMissing > 0).toList();
+    final total = todo.fold<int>(0, (s, d) => s + d.ocrMissing);
+    if (total == 0) return;
+    final done = ValueNotifier<int>(0);
+    var failed = 0;
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (d) => PopScope(
+        canPop: false,
+        child: AlertDialog(
+          title: const Text('글자 인식 중'),
+          content: ValueListenableBuilder<int>(
+            valueListenable: done,
+            builder: (_, n, _) => Column(mainAxisSize: MainAxisSize.min, children: [
+              LinearProgressIndicator(value: n / total),
+              const SizedBox(height: 12),
+              Text('$n / $total페이지'),
+            ]),
+          ),
+        ),
+      ),
+    );
+    for (final d in todo) {
+      try {
+        await Store.load(d);
+        for (final p in d.pages.where((p) => p.ocr == null)) {
+          try {
+            p.ocr = await Ocr.recognize(p);
+          } catch (_) {
+            failed++;
+          }
+          done.value++;
+        }
+        await Store.save(d);
+      } catch (_) {
+        failed++;
+      }
+      d.pages = [];
+    }
+    if (mounted) Navigator.of(context, rootNavigator: true).pop();
+    done.dispose();
+    await _refresh();
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(failed == 0 ? '글자 인식을 마쳤습니다' : '글자 인식을 마쳤습니다 (읽지 못한 페이지 $failed장)')));
+    }
+  }
 
   List<String> get _folders =>
       ({for (final d in _docs ?? <ScanDoc>[]) ?d.folder}.toList()..sort());
@@ -205,6 +355,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
         _docs = docs;
         // 보고 있던 폴더가 비어서 없어졌으면 '전체'로
         if (_folder != null && !docs.any((d) => d.folder == _folder)) _folder = null;
+        // 태그도 마찬가지
+        if (_tag != null && !docs.any((d) => hasTag(d.tags, _tag!))) _tag = null;
+        _recomputeHits();
       });
     }
   }
@@ -214,7 +367,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
     if (!mounted) return;
     await Navigator.push(
         context, MaterialPageRoute(
-            builder: (_) => DocumentScreen(doc: doc, scanFirst: scanFirst, galleryFirst: gallery)));
+            builder: (_) => DocumentScreen(
+                doc: doc, scanFirst: scanFirst, galleryFirst: gallery, knownTags: _allTags)));
     final count = doc.pages.length;
     // 저장이 끝난 뒤에 메모리에서 내린다. 페이지가 하나도 없는 문서는 보관함에서도 지운다.
     if (count > 0) {
@@ -247,6 +401,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
               title: Text(doc.folder == null ? '폴더로 이동' : '폴더 바꾸기 (지금: ${doc.folder})'),
               onTap: () => Navigator.pop(s, 'folder')),
           ListTile(
+              leading: const Icon(Icons.sell_outlined),
+              title: Text(doc.tags.isEmpty ? '태그 달기' : '태그 바꾸기 (${doc.tags.map((t) => '#$t').join(' ')})'),
+              onTap: () => Navigator.pop(s, 'tags')),
+          ListTile(
               leading: const Icon(Icons.edit_outlined),
               title: const Text('이름 바꾸기'),
               onTap: () => Navigator.pop(s, 'rename')),
@@ -266,6 +424,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
     }
     if (action == 'folder') {
       await _moveToFolder([doc]);
+      return;
+    }
+    if (action == 'tags') {
+      await _editTags([doc]);
       return;
     }
     if (action == 'rename') {
@@ -310,11 +472,15 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final docs = _docs
-        ?.where((d) => _query.isEmpty || d.name.toLowerCase().contains(_query.toLowerCase()))
-        .where((d) => _folder == null || d.folder == _folder)
-        .toList();
+    final searchingNow = searchTerms(_query).isNotEmpty;
+    final docs = _docs?.where((d) => (!searchingNow || _hits.containsKey(d.id)) && _inView(d)).toList();
     final folders = _folders;
+    final tags = _allTags;
+    // 검색 중, 이 폴더·태그 안에서 글자 인식이 안 된 페이지 (이 문서들은 본문 검색에서 빠져 있다)
+    final unread = searchingNow
+        ? (_docs ?? <ScanDoc>[]).where((d) => _inView(d) && d.ocrMissing > 0).toList()
+        : <ScanDoc>[];
+    final unreadPages = unread.fold<int>(0, (s, d) => s + d.ocrMissing);
     return Scaffold(
       appBar: _selectMode
           ? AppBar(
@@ -341,8 +507,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
             ? TextField(
                 autofocus: true,
                 decoration: const InputDecoration(
-                    hintText: '문서 이름 검색', filled: false, border: InputBorder.none),
-                onChanged: (v) => setState(() => _query = v),
+                    hintText: '이름·본문·메모·태그 검색', filled: false, border: InputBorder.none),
+                onChanged: (v) => setState(() {
+                  _query = v;
+                  _recomputeHits();
+                }),
               )
             : Row(children: [
                 const AppLogo(size: 30),
@@ -356,6 +525,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
               onPressed: () => setState(() {
                 _searching = !_searching;
                 _query = '';
+                _recomputeHits();
               }),
             ),
           if (_docs?.isNotEmpty ?? false)
@@ -397,6 +567,17 @@ class _LibraryScreenState extends State<LibraryScreen> {
           : _docs!.isEmpty
               ? const _Empty()
               : Column(children: [
+                  if (unreadPages > 0)
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
+                      child: Row(children: [
+                        Expanded(
+                          child: Text('글자 인식 안 된 페이지 $unreadPages장 (문서 ${unread.length}개)는 본문 검색에서 빠져 있어요',
+                              style: const TextStyle(color: AppColors.muted, fontSize: 12.5)),
+                        ),
+                        TextButton(onPressed: () => _recognizeMissing(unread), child: const Text('지금 인식')),
+                      ]),
+                    ),
                   if (folders.isNotEmpty)
                     SizedBox(
                       height: 48,
@@ -418,6 +599,27 @@ class _LibraryScreenState extends State<LibraryScreen> {
                         ],
                       ),
                     ),
+                  if (tags.isNotEmpty)
+                    SizedBox(
+                      height: 44,
+                      child: ListView(
+                        scrollDirection: Axis.horizontal,
+                        padding: const EdgeInsets.symmetric(horizontal: 16),
+                        children: [
+                          for (final t in <String?>[null, ...tags])
+                            Padding(
+                              padding: const EdgeInsets.only(right: 8),
+                              child: FilterChip(
+                                visualDensity: VisualDensity.compact,
+                                showCheckmark: false,
+                                label: Text(t == null ? '태그 전체' : '#$t'),
+                                selected: _tag == t,
+                                onSelected: (_) => setState(() => _tag = t),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
                   Expanded(
                     child: RefreshIndicator(
                   onRefresh: _refresh,
@@ -428,6 +630,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     itemCount: docs.length,
                     itemBuilder: (_, i) => _DocCard(
                       doc: docs[i],
+                      hit: _hits[docs[i].id],
                       selectMode: _selectMode,
                       selected: _selected.contains(docs[i].id),
                       onTap: () => _selectMode ? _toggle(docs[i]) : _open(docs[i]),
@@ -452,22 +655,32 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     color: AppColors.surface, border: Border(top: BorderSide(color: Colors.white10))),
                 child: Row(children: [
                   Expanded(
-                    child: OutlinedButton.icon(
+                    child: OutlinedButton(
+                      style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 4)),
                       onPressed: _selected.isEmpty
                           ? null
                           : () => _moveToFolder(_docs!.where((d) => _selected.contains(d.id)).toList()),
-                      icon: const Icon(Icons.drive_file_move_outline),
-                      label: const Text('폴더로'),
+                      child: const Text('폴더로'),
                     ),
                   ),
                   const SizedBox(width: 8),
                   Expanded(
-                    child: OutlinedButton.icon(
+                    child: OutlinedButton(
+                      style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 4)),
+                      onPressed: _selected.isEmpty
+                          ? null
+                          : () => _editTags(_docs!.where((d) => _selected.contains(d.id)).toList()),
+                      child: const Text('태그'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: OutlinedButton(
+                      style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 4)),
                       onPressed: _selected.isEmpty
                           ? null
                           : () => Backup.create(context, _docs!.where((d) => _selected.contains(d.id)).toList()),
-                      icon: const Icon(Icons.inventory_2_outlined),
-                      label: const Text('백업'),
+                      child: const Text('백업'),
                     ),
                   ),
                   const SizedBox(width: 8),
@@ -523,6 +736,7 @@ class _DocCard extends StatelessWidget {
     required this.onTap,
     required this.onLongPress,
     required this.onMenu,
+    this.hit,
     this.selectMode = false,
     this.selected = false,
   });
@@ -531,6 +745,9 @@ class _DocCard extends StatelessWidget {
   final VoidCallback onTap;
   final VoidCallback onLongPress;
   final VoidCallback onMenu;
+
+  /// 검색 중이면 맞은 곳 (이름에서만 맞았으면 줄은 비어 있다)
+  final SearchHit? hit;
   final bool selectMode;
   final bool selected;
 
@@ -622,7 +839,20 @@ class _DocCard extends StatelessWidget {
             overflow: TextOverflow.ellipsis,
             style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
         const SizedBox(height: 2),
-        Text(_date(doc.updated), style: const TextStyle(color: AppColors.muted, fontSize: 12)),
+        Text([_date(doc.updated), ...doc.tags.map((t) => '#$t')].join(' '),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(color: AppColors.muted, fontSize: 12)),
+        if (hit != null && hit!.line.isNotEmpty)
+          Text(hit!.line,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: AppColors.accent, fontSize: 12)),
+        if (hit != null && doc.ocrMissing > 0)
+          Text('글자 인식 안 된 페이지 ${doc.ocrMissing}장',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: Colors.orangeAccent, fontSize: 11.5)),
       ]),
     );
   }

@@ -61,6 +61,7 @@ class PageData {
     this.stamps = const [],
     this.ocr,
     this.hasMask = false,
+    this.memo = '',
   });
 
   final String id;
@@ -86,6 +87,9 @@ class PageData {
   /// 배경 제거 마스크 파일이 있는지. doc.json 에는 적히지 않고, 남길 파일 계산에만 쓴다.
   final bool hasMask;
 
+  /// 페이지 메모 (없으면 빈 글자, doc.json 에는 있을 때만 적힌다)
+  final String memo;
+
   PageData copyWith({int? w, int? h, ShapeData? detShape, ShapeData? shape}) => PageData(
         id: id,
         src: src,
@@ -101,6 +105,7 @@ class PageData {
         stamps: stamps,
         ocr: ocr,
         hasMask: hasMask,
+        memo: memo,
       );
 }
 
@@ -113,6 +118,8 @@ class DocData {
     required this.updated,
     this.folder,
     this.pages = const [],
+    this.tags = const [],
+    this.memo = '',
   });
 
   final String id;
@@ -122,7 +129,20 @@ class DocData {
   final String? folder;
   final List<PageData> pages;
 
-  DocData copyWith({String? name, DateTime? updated, List<PageData>? pages, String? folder, bool clearFolder = false}) =>
+  /// 태그 (없으면 빈 목록, doc.json 에는 있을 때만 적힌다)
+  final List<String> tags;
+
+  /// 문서 메모 (없으면 빈 글자, doc.json 에는 있을 때만 적힌다)
+  final String memo;
+
+  DocData copyWith(
+          {String? name,
+          DateTime? updated,
+          List<PageData>? pages,
+          String? folder,
+          bool clearFolder = false,
+          List<String>? tags,
+          String? memo}) =>
       DocData(
         id: id,
         name: name ?? this.name,
@@ -130,28 +150,59 @@ class DocData {
         updated: updated ?? this.updated,
         folder: clearFolder ? null : (folder ?? this.folder),
         pages: pages ?? this.pages,
+        tags: tags ?? this.tags,
+        memo: memo ?? this.memo,
       );
 }
 
 /// 보관함 목록용: 페이지를 읽지 않고 얻는 정보.
 class DocHeader {
-  DocHeader(this.id, this.name, this.created, this.updated, this.folder, this.pageCount);
+  DocHeader(this.id, this.name, this.created, this.updated, this.folder, this.pageCount,
+      {this.tags = const [], this.memo = '', this.ocrTexts = const [], this.pageMemos = const []});
   final String id;
   final String name;
   final DateTime created;
   final DateTime updated;
   final String? folder;
   final int pageCount;
+  final List<String> tags;
+  final String memo;
+
+  /// 검색용: 페이지마다 OCR 글자 한 덩어리 (null 이면 글자 인식을 안 한 페이지). doc.json 에 따로 적지 않고 읽을 때 만든다.
+  final List<String?> ocrTexts;
+
+  /// 검색용: 페이지마다 메모 (없으면 빈 글자)
+  final List<String> pageMemos;
+
+  /// 글자 인식이 안 된 페이지 수
+  int get ocrMissing => ocrTexts.where((t) => t == null).length;
 }
 
-DocHeader docHeaderFromJson(Map<String, dynamic> j) => DocHeader(
-      j['id'],
-      j['name'],
-      DateTime.parse(j['created']),
-      DateTime.parse(j['updated']),
-      j['folder'],
-      (j['pages'] as List).length,
-    );
+DocHeader docHeaderFromJson(Map<String, dynamic> j) {
+  final pages = (j['pages'] as List);
+  final texts = <String?>[];
+  final memos = <String>[];
+  for (final p in pages) {
+    final pj = p as Map<String, dynamic>;
+    final o = pj['ocr'] as List?;
+    texts.add(o == null ? null : [for (final l in o) l['t'] as String].join(' '));
+    memos.add((pj['memo'] as String?) ?? '');
+  }
+  return DocHeader(
+    j['id'],
+    j['name'],
+    DateTime.parse(j['created']),
+    DateTime.parse(j['updated']),
+    j['folder'],
+    pages.length,
+    tags: tagsFromJson(j['tags']),
+    memo: (j['memo'] as String?) ?? '',
+    ocrTexts: texts,
+    pageMemos: memos,
+  );
+}
+
+List<String> tagsFromJson(Object? v) => v == null ? const [] : [for (final t in v as List) t as String];
 
 // ── 문서 → JSON ──
 
@@ -184,6 +235,7 @@ Map<String, dynamic> pageToJson(PageData p) => {
           : [
               for (final l in p.ocr!) {'t': l.text, 'b': [l.box.$1, l.box.$2, l.box.$3, l.box.$4]},
             ],
+      if (p.memo.isNotEmpty) 'memo': p.memo,
     };
 
 Map<String, dynamic> docToJson(DocData d) => {
@@ -192,6 +244,8 @@ Map<String, dynamic> docToJson(DocData d) => {
       'created': d.created.toIso8601String(),
       'updated': d.updated.toIso8601String(),
       'folder': d.folder,
+      if (d.tags.isNotEmpty) 'tags': d.tags,
+      if (d.memo.isNotEmpty) 'memo': d.memo,
       'pages': [for (final p in d.pages) pageToJson(p)],
     };
 
@@ -237,6 +291,7 @@ PageData pageFromJson(Map<String, dynamic> pj, {Set<String>? files}) {
                   (l['b'][0].toDouble(), l['b'][1].toDouble(), l['b'][2].toDouble(), l['b'][3].toDouble())),
           ],
     hasMask: files != null && files.contains('mask_$id.png'),
+    memo: (pj['memo'] as String?) ?? '',
   );
 }
 
@@ -247,6 +302,8 @@ DocData docFromJson(Map<String, dynamic> j, {Set<String>? files}) => DocData(
       updated: DateTime.parse(j['updated']),
       folder: j['folder'],
       pages: [for (final pj in (j['pages'] as List)) pageFromJson(pj as Map<String, dynamic>, files: files)],
+      tags: tagsFromJson(j['tags']),
+      memo: (j['memo'] as String?) ?? '',
     );
 
 // ── 파일 이름 ──
@@ -283,6 +340,9 @@ Set<String> keepFiles(DocData d) {
 
 /// 폴더만 바꾼 문서 (null 이면 폴더에서 뺌).
 DocData withFolder(DocData d, String? folder) => d.copyWith(folder: folder, clearFolder: folder == null);
+
+/// 태그만 바꾼 문서. updated 는 그대로.
+DocData withTags(DocData d, List<String> tags) => d.copyWith(tags: tags);
 
 /// 원본을 줄일 배율. 줄일 필요가 없으면(0.95 이상) 1.
 double shrinkScale(int w, int h, int maxSide) {

@@ -60,6 +60,9 @@ class ScanPage {
   Uint8List jpg;
   OcrResult? ocr;
 
+  /// 페이지 메모 (없으면 빈 글자)
+  String memo = '';
+
   /// 필터·회전을 다시 입힌다. 글자 인식 결과는 위치가 바뀌므로 지운다.
   Future<void> render() async {
     var out = mode == ScanMode.original && quarterTurns % 4 == 0

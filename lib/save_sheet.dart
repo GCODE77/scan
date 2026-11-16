@@ -14,6 +14,7 @@ import 'package:pdf/widgets.dart' as pw;
 import 'package:share_plus/share_plus.dart';
 
 import 'ocr.dart';
+import 'text_export.dart';
 import 'pdf_crypt.dart';
 import 'scanner.dart';
 import 'theme.dart';
@@ -55,6 +56,10 @@ class SaveOptions {
   bool pageNumbers = false;
   String? watermark; // 비어 있으면 없음
   String? password; // 비어 있으면 암호 없음
+
+  /// TXT·DOCX 에 문서 메모와 페이지 메모를 넣을지 (메모가 있을 때만 의미가 있다)
+  bool includeMemo = true;
+  String docMemo = '';
 }
 
 /// 지난번에 쓴 저장 설정을 기억해 다음에 기본값으로 쓴다 (암호·워터마크는 기억하지 않는다).
@@ -96,12 +101,14 @@ class _SavePrefs {
 
 /// 저장 옵션 시트. 고른 옵션과 저장 방법을 돌려준다.
 Future<(SaveOptions, SaveTarget)?> showSaveSheet(
-    BuildContext context, List<ScanPage> pages, Set<ScanPage> selectedPages, String docName) async {
+    BuildContext context, List<ScanPage> pages, Set<ScanPage> selectedPages, String docName,
+    {String docMemo = ''}) async {
   final total = pages.length, selected = selectedPages.length;
   final o = SaveOptions()
     // 파일 이름에 쓸 수 없는 글자는 바꾼다
     ..name = docName.replaceAll(RegExp(r'[\/:*?"<>|]'), '-').replaceAll(' ', '_')
-    ..onlySelected = selected > 0;
+    ..onlySelected = selected > 0
+    ..docMemo = docMemo;
   await _SavePrefs.load(o);
   if (!context.mounted) return null;
   final nameCtl = TextEditingController(text: o.name);
@@ -222,6 +229,16 @@ Future<(SaveOptions, SaveTarget)?> showSaveSheet(
                         style: const TextStyle(color: AppColors.accent, fontSize: 13, fontWeight: FontWeight.w700));
                   }),
                 ),
+                if ((o.formats.contains(SaveFormat.txt) || o.formats.contains(SaveFormat.docx)) &&
+                    hasAnyMemo(o.docMemo, _exportPages(targets)))
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('메모 포함'),
+                    subtitle: const Text('TXT·DOCX에 문서·페이지 메모를 함께',
+                        style: TextStyle(color: AppColors.muted)),
+                    value: o.includeMemo,
+                    onChanged: (v) => set(() => o.includeMemo = v),
+                  ),
                 if (o.formats.any((f) => f != SaveFormat.txt && f != SaveFormat.docx)) ...[
                   const SizedBox(height: 22),
                   const _Label('화질'),
@@ -419,12 +436,12 @@ Future<String?> runSave(List<ScanPage> pages, SaveOptions o, SaveTarget target) 
         outs.add(('${o.name}.pdf', await _buildPdf(pages, o, maxSide, quality), 'application/pdf'));
 
       case SaveFormat.txt:
-        outs.add(('${o.name}.txt', _txtBytes(pages), 'text/plain'));
+        outs.add(('${o.name}.txt', _txtBytes(pages, o), 'text/plain'));
 
       case SaveFormat.docx:
         outs.add((
           '${o.name}.docx',
-          _buildDocx(pages),
+          _buildDocx(pages, o),
           'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
         ));
 
@@ -492,12 +509,13 @@ Future<String?> runSave(List<ScanPage> pages, SaveOptions o, SaveTarget target) 
   return parts.isEmpty ? null : '${parts.join(' + ')} 저장 완료';
 }
 
+/// 내보낼 글자 (OCR 글자와 페이지 메모). 조립은 text_export.dart 의 순수 함수가 한다.
+List<ExportPage> _exportPages(List<ScanPage> pages) => [for (final p in pages) ExportPage(p.ocr?.text ?? '', p.memo)];
+
 /// TXT 파일 내용. BOM을 붙여야 윈도우 메모장에서도 한글이 깨지지 않는다.
-Uint8List _txtBytes(List<ScanPage> pages) {
-  final text = [
-    for (var i = 0; i < pages.length; i++) '── ${i + 1}페이지 ──\n${pages[i].ocr?.text ?? ''}',
-  ].join('\n\n');
-  return Uint8List.fromList([0xEF, 0xBB, 0xBF, ...utf8.encode(text)]);
+Uint8List _txtBytes(List<ScanPage> pages, SaveOptions o) {
+  final ex = _exportPages(pages);
+  return buildTxtBytes(ex, docMemo: o.docMemo, includeMemo: o.includeMemo && hasAnyMemo(o.docMemo, ex));
 }
 
 /// 파일 크기를 사람이 읽기 쉽게 (KB·MB)
@@ -518,8 +536,8 @@ class _SizeEstimate {
   /// 예상 바이트 (아직 계산 중이면 null)
   int? bytes(SaveFormat f, SaveQuality q) {
     if (pages.isEmpty) return 0;
-    if (f == SaveFormat.txt) return _txtBytes(pages).length;
-    if (f == SaveFormat.docx) return _buildDocx(pages).length;
+    if (f == SaveFormat.txt) return _txtBytes(pages, o).length;
+    if (f == SaveFormat.docx) return _buildDocx(pages, o).length;
     final pr = probe;
     if (pr == null) return null;
     final qi = SaveQuality.values.indexOf(q);
@@ -602,40 +620,10 @@ class _SizeEstimate {
   return null;
 }
 
-String _xml(String t) =>
-    t.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
-
-/// OCR 글자를 페이지별로 담은 워드 문서(.docx). 페이지 사이에 쪽 나누기가 들어간다.
-Uint8List _buildDocx(List<ScanPage> pages) {
-  final body = StringBuffer();
-  for (var i = 0; i < pages.length; i++) {
-    if (i > 0) body.write('<w:p><w:r><w:br w:type="page"/></w:r></w:p>');
-    for (final line in (pages[i].ocr?.text ?? '').split('\n')) {
-      body.write('<w:p><w:r><w:t xml:space="preserve">${_xml(line)}</w:t></w:r></w:p>');
-    }
-  }
-  const ns = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
-  Uint8List u(String s) => Uint8List.fromList(utf8.encode(s));
-  final z = Archive()
-    ..addFile(ArchiveFile.bytes(
-        '[Content_Types].xml',
-        u('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-            '<Default Extension="xml" ContentType="application/xml"/>'
-            '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
-            '</Types>')))
-    ..addFile(ArchiveFile.bytes(
-        '_rels/.rels',
-        u('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
-            '</Relationships>')))
-    ..addFile(ArchiveFile.bytes(
-        'word/document.xml',
-        u('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            '<w:document xmlns:w="$ns"><w:body>$body<w:sectPr/></w:body></w:document>')));
-  return Uint8List.fromList(ZipEncoder().encode(z));
+/// OCR 글자(와 메모)를 페이지별로 담은 워드 문서(.docx). 페이지 사이에 쪽 나누기가 들어간다.
+Uint8List _buildDocx(List<ScanPage> pages, SaveOptions o) {
+  final ex = _exportPages(pages);
+  return buildDocxBytes(ex, docMemo: o.docMemo, includeMemo: o.includeMemo && hasAnyMemo(o.docMemo, ex));
 }
 
 /// 검색 가능한 PDF: 페이지 사진 위에 OCR 글자를 보이지 않게 겹쳐 넣는다.

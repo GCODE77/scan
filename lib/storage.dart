@@ -5,6 +5,7 @@ import 'dart:ui' show Offset, Rect;
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
+import 'doc_search.dart';
 import 'ocr.dart';
 import 'scanner.dart';
 import 'signature.dart';
@@ -28,6 +29,20 @@ class ScanDoc {
 
   /// 폴더 이름 (null이면 폴더 없음)
   String? folder;
+
+  /// 태그와 문서 메모 (목록을 읽을 때 같이 읽는다)
+  List<String> tags = [];
+  String memo = '';
+
+  /// 검색용: 페이지마다 OCR 글자(null=글자 인식 안 됨)와 메모. 목록을 읽을 때 만들고, 문서를 열었다 닫으면 다시 읽을 때까지 그대로다.
+  List<String?> ocrTexts = [];
+  List<String> pageMemos = [];
+
+  /// 글자 인식이 안 된 페이지 수 (검색용 글자 기준)
+  int get ocrMissing => ocrTexts.where((t) => t == null).length;
+
+  SearchDoc get searchDoc =>
+      SearchDoc(name: name, tags: tags, memo: memo, pageTexts: ocrTexts, pageMemos: pageMemos);
 }
 
 /// 기기 안(앱 전용 폴더)에 문서를 보관한다.
@@ -85,7 +100,11 @@ class Store {
     final h = docHeaderFromJson(j);
     return ScanDoc(id: h.id, name: h.name, created: h.created, updated: h.updated)
       ..folder = h.folder
-      ..pageCount = h.pageCount;
+      ..pageCount = h.pageCount
+      ..tags = List.of(h.tags)
+      ..memo = h.memo
+      ..ocrTexts = h.ocrTexts
+      ..pageMemos = h.pageMemos;
   }
 
   /// 문서의 페이지들을 읽어 온다.
@@ -104,7 +123,8 @@ class Store {
         ..mode = ScanMode.values.byName(pd.mode)
         ..quarterTurns = pd.turns
         ..strength = pd.strength
-        ..cleaned = pd.cleaned;
+        ..cleaned = pd.cleaned
+        ..memo = pd.memo;
       final pageFile = File('${dir.path}/${pageFileName(id)}');
       if (await pageFile.exists()) p.jpg = await pageFile.readAsBytes();
       final maskFile = File('${dir.path}/${maskFileName(id)}');
@@ -128,6 +148,8 @@ class Store {
     }
     doc.pages = pages;
     doc.pageCount = pages.length;
+    doc.tags = List.of(data.tags);
+    doc.memo = data.memo;
   }
 
   /// 마지막으로 파일에 쓴 이미지 (바뀐 것만 다시 쓰기 위해)
@@ -161,6 +183,8 @@ class Store {
     final dir = await _dir(doc.id);
     doc.updated = DateTime.now();
     doc.pageCount = doc.pages.length;
+    doc.ocrTexts = [for (final p in doc.pages) p.ocr?.lines.map((l) => l.text).join(' ')];
+    doc.pageMemos = [for (final p in doc.pages) p.memo];
     final srcIds = <String>[];
 
     for (final p in doc.pages) {
@@ -218,6 +242,8 @@ class Store {
         created: doc.created,
         updated: doc.updated,
         folder: doc.folder,
+        tags: doc.tags,
+        memo: doc.memo,
         pages: [
           for (final (i, p) in doc.pages.indexed)
             PageData(
@@ -243,6 +269,7 @@ class Store {
                         OcrLineData(l.text, (l.box.left, l.box.top, l.box.width, l.box.height)),
                     ],
               hasMask: p.cutMask != null,
+              memo: p.memo,
             ),
         ],
       );
@@ -285,6 +312,18 @@ class Store {
         final data = docFromJson(jsonDecode(await f.readAsString()) as Map<String, dynamic>);
         await _writeJson(f, withFolder(data, folder));
         doc.folder = folder;
+      });
+
+  /// 문서 여러 개의 태그를 한꺼번에 바꾼다 (더할 것 [add], 뺄 것 [remove]). 폴더 이동처럼 저장 줄에 서서
+  /// 페이지를 읽지 않고 doc.json 의 태그만 고친다. 파일에서 읽은 태그를 기준으로 바꾸므로 메모리의 옛 태그가 덮어쓰지 않는다.
+  static Future<void> changeTags(ScanDoc doc, {List<String> add = const [], List<String> remove = const []}) =>
+      _enqueue(doc.id, () async {
+        final f = File('${(await _docsDir()).path}/${doc.id}/$kDocJson');
+        if (!await f.exists()) return;
+        final data = docFromJson(jsonDecode(await f.readAsString()) as Map<String, dynamic>);
+        final tags = applyTagChanges(data.tags, add: add, remove: remove);
+        await _writeJson(f, withTags(data, tags));
+        doc.tags = tags;
       });
 
   // ── 저장 공간 ──
