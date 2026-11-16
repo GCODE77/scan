@@ -8,6 +8,7 @@ import 'package:path_provider/path_provider.dart';
 import 'ocr.dart';
 import 'scanner.dart';
 import 'signature.dart';
+import 'store_codec.dart';
 
 /// 문서 하나 (스캔한 페이지 묶음).
 class ScanDoc {
@@ -36,6 +37,8 @@ class ScanDoc {
 ///              `flat_<id>.jpg`    편 이미지 (필터 적용 전)
 ///              `page_<id>.jpg`    최종 이미지
 ///              thumb.jpg        보관함 썸네일
+///
+/// doc.json 의 JSON 변환과 '남길 파일' 계산은 순수 함수인 store_codec.dart 에 있다.
 class Store {
   static Directory? _root;
 
@@ -51,12 +54,12 @@ class Store {
     final root = await _docsDir();
     final docs = <ScanDoc>[];
     await for (final e in root.list()) {
-      final f = File('${e.path}/doc.json');
+      final f = File('${e.path}/$kDocJson');
       if (e is! Directory || !await f.exists()) continue;
       try {
         final j = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
-        final d = _docFrom(j)..pageCount = (j['pages'] as List).length;
-        final thumb = File('${e.path}/thumb.jpg');
+        final d = _docFrom(j);
+        final thumb = File('${e.path}/$kThumbJpg');
         if (await thumb.exists()) d.thumbPath = thumb.path;
         docs.add(d);
       } catch (e) {
@@ -78,49 +81,46 @@ class Store {
     );
   }
 
-  static ScanDoc _docFrom(Map<String, dynamic> j) => ScanDoc(
-        id: j['id'],
-        name: j['name'],
-        created: DateTime.parse(j['created']),
-        updated: DateTime.parse(j['updated']),
-      )..folder = j['folder'];
+  static ScanDoc _docFrom(Map<String, dynamic> j) {
+    final h = docHeaderFromJson(j);
+    return ScanDoc(id: h.id, name: h.name, created: h.created, updated: h.updated)
+      ..folder = h.folder
+      ..pageCount = h.pageCount;
+  }
 
   /// 문서의 페이지들을 읽어 온다.
   static Future<void> load(ScanDoc doc) async {
     final dir = await _dir(doc.id);
-    final j = jsonDecode(await File('${dir.path}/doc.json').readAsString());
+    final j = jsonDecode(await File('${dir.path}/$kDocJson').readAsString()) as Map<String, dynamic>;
+    final data = docFromJson(j);
     final dets = <String, Detection>{}; // 같은 원본에서 나온 페이지(양면)는 같은 객체를 쓴다
     final pages = <ScanPage>[];
-    for (final pj in j['pages'] as List) {
-      final src = pj['src'] as String;
-      final det = dets[src] ??= Detection.stored(
-          '${dir.path}/src_$src.jpg', pj['w'], pj['h'], _shapeFrom(pj['detShape']));
-      final id = pj['id'] as String;
-      final flat = await File('${dir.path}/flat_$id.jpg').readAsBytes();
-      final p = ScanPage(det: det, shape: _shapeFrom(pj['shape']), part: pj['part'], flat: flat, id: id)
-        ..mode = ScanMode.values.byName(pj['mode'])
-        ..quarterTurns = pj['turns']
-        ..strength = (pj['strength'] as num?)?.toDouble() ?? 1
-        ..cleaned = pj['cleaned'] == true;
-      final pageFile = File('${dir.path}/page_$id.jpg');
+    for (final pd in data.pages) {
+      final det = dets[pd.src] ??=
+          Detection.stored('${dir.path}/${srcFileName(pd.src)}', pd.w, pd.h, _shapeFrom(pd.detShape));
+      final id = pd.id;
+      final flat = await File('${dir.path}/${flatFileName(id)}').readAsBytes();
+      final p = ScanPage(det: det, shape: _shapeFrom(pd.shape), part: pd.part, flat: flat, id: id)
+        ..mode = ScanMode.values.byName(pd.mode)
+        ..quarterTurns = pd.turns
+        ..strength = pd.strength
+        ..cleaned = pd.cleaned;
+      final pageFile = File('${dir.path}/${pageFileName(id)}');
       if (await pageFile.exists()) p.jpg = await pageFile.readAsBytes();
-      final maskFile = File('${dir.path}/mask_$id.png');
+      final maskFile = File('${dir.path}/${maskFileName(id)}');
       if (await maskFile.exists()) {
         p.cutMask = await maskFile.readAsBytes();
         _savedMask[p] = p.cutMask;
       }
-      for (final (i, sj) in ((pj['stamps'] as List?) ?? const []).indexed) {
-        final f = File('${dir.path}/stamp_${id}_$i.png');
+      for (final (i, sd) in pd.stamps.indexed) {
+        final f = File('${dir.path}/${stampFileName(id, i)}');
         if (!await f.exists()) continue;
-        p.stamps.add(Stamp(await f.readAsBytes(),
-            Rect.fromLTWH(sj['l'].toDouble(), sj['t'].toDouble(), sj['w'].toDouble(), sj['h'].toDouble()),
-            turns: sj['r']));
+        p.stamps.add(Stamp(await f.readAsBytes(), Rect.fromLTWH(sd.rect.$1, sd.rect.$2, sd.rect.$3, sd.rect.$4),
+            turns: sd.turns));
       }
-      if (pj['ocr'] != null) {
+      if (pd.ocr != null) {
         p.ocr = OcrResult([
-          for (final l in pj['ocr'] as List)
-            OcrLine(l['t'], Rect.fromLTWH(l['b'][0].toDouble(), l['b'][1].toDouble(),
-                l['b'][2].toDouble(), l['b'][3].toDouble())),
+          for (final l in pd.ocr!) OcrLine(l.text, Rect.fromLTWH(l.box.$1, l.box.$2, l.box.$3, l.box.$4)),
         ]);
       }
       _saved[p] = (p.flat, p.jpg);
@@ -134,22 +134,39 @@ class Store {
   static final _saved = Expando<(Uint8List, Uint8List)>();
   static final _savedMask = Expando<Uint8List>();
 
-  /// 같은 문서의 저장이 겹치지 않도록 줄 세운다.
+  /// 같은 문서의 저장·폴더 이동·원본 줄이기가 겹치지 않도록 줄 세운다.
   static final _queues = <String, Future<void>>{};
 
-  static Future<void> save(ScanDoc doc) =>
-      _queues[doc.id] = (_queues[doc.id] ?? Future.value()).then((_) => _save(doc));
+  /// 문서별 줄에 일을 세운다. 앞 일이 실패해도 뒷일은 돈다. 돌려주는 값은 이 일 자신의 결과.
+  static Future<T> _enqueue<T>(String id, Future<T> Function() task) {
+    final prev = _queues[id] ?? Future.value();
+    final run = prev.catchError((_) {}).then((_) => task());
+    _queues[id] = run.then((_) {}, onError: (_) {});
+    return run;
+  }
+
+  static Future<void> save(ScanDoc doc) => _enqueue(doc.id, () => _save(doc));
+
+  /// 임시 파일에 쓰고 바꿔치기 (도중에 꺼져도 파일이 깨지지 않게)
+  static Future<void> _writeAtomic(File target, List<int> bytes) async {
+    final tmp = File('${target.path}.tmp');
+    await tmp.writeAsBytes(bytes, flush: true);
+    await tmp.rename(target.path);
+  }
+
+  static Future<void> _writeJson(File target, DocData data) =>
+      _writeAtomic(target, utf8.encode(docToJsonString(data)));
 
   static Future<void> _save(ScanDoc doc) async {
     final dir = await _dir(doc.id);
     doc.updated = DateTime.now();
     doc.pageCount = doc.pages.length;
-    final keep = <String>{'doc.json', 'thumb.jpg'};
+    final srcIds = <String>[];
 
     for (final p in doc.pages) {
       final det = p.det;
-      final srcId = det.path == null ? p.id : _srcIdOf(det.path!);
-      final srcName = 'src_$srcId.jpg';
+      final srcId = det.path == null ? p.id : srcIdOfPath(det.path!);
+      final srcName = srcFileName(srcId);
       if (det.path == null) {
         await File('${dir.path}/$srcName').writeAsBytes(det.jpg);
         det.storedAt('${dir.path}/$srcName');
@@ -158,88 +175,77 @@ class Store {
         await File(det.path!).copy('${dir.path}/$srcName');
         det.storedAt('${dir.path}/$srcName');
       }
-      keep.addAll([srcName, 'flat_${p.id}.jpg', 'page_${p.id}.jpg']);
+      srcIds.add(srcId);
       for (final (i, st) in p.stamps.indexed) {
-        final name = 'stamp_${p.id}_$i.png';
-        keep.add(name);
-        await File('${dir.path}/$name').writeAsBytes(st.png);
+        await File('${dir.path}/${stampFileName(p.id, i)}').writeAsBytes(st.png);
       }
       final last = _saved[p];
       if (last == null || !identical(last.$1, p.flat)) {
-        await File('${dir.path}/flat_${p.id}.jpg').writeAsBytes(p.flat);
+        await File('${dir.path}/${flatFileName(p.id)}').writeAsBytes(p.flat);
       }
       if (last == null || !identical(last.$2, p.jpg)) {
-        await File('${dir.path}/page_${p.id}.jpg').writeAsBytes(p.jpg);
+        await File('${dir.path}/${pageFileName(p.id)}').writeAsBytes(p.jpg);
       }
       _saved[p] = (p.flat, p.jpg);
       // 배경 제거 마스크
-      if (p.cutMask != null) {
-        keep.add('mask_${p.id}.png');
-        if (!identical(_savedMask[p], p.cutMask)) {
-          await File('${dir.path}/mask_${p.id}.png').writeAsBytes(p.cutMask!);
-        }
+      if (p.cutMask != null && !identical(_savedMask[p], p.cutMask)) {
+        await File('${dir.path}/${maskFileName(p.id)}').writeAsBytes(p.cutMask!);
       }
       _savedMask[p] = p.cutMask;
     }
 
     if (doc.pages.isNotEmpty) {
       final thumb = await compute(transcode, (doc.pages.first.jpg, 'jpg', 480, 80));
-      await File('${dir.path}/thumb.jpg').writeAsBytes(thumb);
-      doc.thumbPath = '${dir.path}/thumb.jpg';
+      await File('${dir.path}/$kThumbJpg').writeAsBytes(thumb);
+      doc.thumbPath = '${dir.path}/$kThumbJpg';
     }
 
-    final json = {
-      'id': doc.id,
-      'name': doc.name,
-      'created': doc.created.toIso8601String(),
-      'updated': doc.updated.toIso8601String(),
-      'folder': doc.folder,
-      'pages': [
-        for (final p in doc.pages)
-          {
-            'id': p.id,
-            'src': _srcIdOf(p.det.path!),
-            'w': p.det.width,
-            'h': p.det.height,
-            'detShape': _shapeTo(p.det.shape),
-            'shape': _shapeTo(p.shape),
-            'part': p.part,
-            'mode': p.mode.name,
-            'turns': p.quarterTurns,
-            'strength': p.strength,
-            'cleaned': p.cleaned,
-            'stamps': [
-              for (final st in p.stamps)
-                {'l': st.rect.left, 't': st.rect.top, 'w': st.rect.width, 'h': st.rect.height, 'r': st.turns},
-            ],
-            'ocr': p.ocr == null
-                ? null
-                : [
-                    for (final l in p.ocr!.lines)
-                      {
-                        't': l.text,
-                        'b': [l.box.left, l.box.top, l.box.width, l.box.height],
-                      },
-                  ],
-          },
-      ],
-    };
-    // 임시 파일에 쓰고 바꿔치기 (도중에 꺼져도 문서가 깨지지 않게)
-    final tmp = File('${dir.path}/doc.json.tmp');
-    await tmp.writeAsString(jsonEncode(json));
-    await tmp.rename('${dir.path}/doc.json');
+    final data = _toData(doc, srcIds);
+    await _writeJson(File('${dir.path}/$kDocJson'), data);
 
     // 더 이상 쓰지 않는 파일 정리
+    final keep = keepFiles(data);
     await for (final f in dir.list()) {
       final name = f.uri.pathSegments.last;
       if (f is File && !keep.contains(name)) await f.delete();
     }
   }
 
-  static String _srcIdOf(String path) {
-    final name = path.split('/').last;
-    return name.substring(4, name.length - 4); // src_<id>.jpg
-  }
+  /// 메모리의 문서를 저장용 값으로 ([srcIds]는 페이지마다의 원본 번호).
+  static DocData _toData(ScanDoc doc, List<String> srcIds) => DocData(
+        id: doc.id,
+        name: doc.name,
+        created: doc.created,
+        updated: doc.updated,
+        folder: doc.folder,
+        pages: [
+          for (final (i, p) in doc.pages.indexed)
+            PageData(
+              id: p.id,
+              src: srcIds[i],
+              w: p.det.width,
+              h: p.det.height,
+              detShape: _shapeTo(p.det.shape),
+              shape: _shapeTo(p.shape),
+              part: p.part,
+              mode: p.mode.name,
+              turns: p.quarterTurns,
+              strength: p.strength,
+              cleaned: p.cleaned,
+              stamps: [
+                for (final st in p.stamps)
+                  StampData((st.rect.left, st.rect.top, st.rect.width, st.rect.height), st.turns),
+              ],
+              ocr: p.ocr == null
+                  ? null
+                  : [
+                      for (final l in p.ocr!.lines)
+                        OcrLineData(l.text, (l.box.left, l.box.top, l.box.width, l.box.height)),
+                    ],
+              hasMask: p.cutMask != null,
+            ),
+        ],
+      );
 
   static Future<void> delete(ScanDoc doc) async {
     await _queues[doc.id];
@@ -253,37 +259,33 @@ class Store {
     await save(doc);
   }
 
-  static Map<String, dynamic> _shapeTo(PageShape s) => {
-        'top': [for (final p in s.top) [p.dx, p.dy]],
-        'bottom': [for (final p in s.bottom) [p.dx, p.dy]],
-        'spread': s.spread,
-        if (s.leftBow != Offset.zero) 'leftBow': [s.leftBow.dx, s.leftBow.dy],
-        if (s.rightBow != Offset.zero) 'rightBow': [s.rightBow.dx, s.rightBow.dy],
-      };
+  static ShapeData _shapeTo(PageShape s) => ShapeData(
+        [for (final p in s.top) (p.dx, p.dy)],
+        [for (final p in s.bottom) (p.dx, p.dy)],
+        s.spread,
+        leftBow: (s.leftBow.dx, s.leftBow.dy),
+        rightBow: (s.rightBow.dx, s.rightBow.dy),
+      );
 
-  static PageShape _shapeFrom(Map<String, dynamic> j) {
-    List<Offset> pts(String k) =>
-        [for (final p in j[k] as List) Offset((p[0] as num).toDouble(), (p[1] as num).toDouble())];
-    Offset bow(String k) {
-      final v = j[k] as List?;
-      return v == null ? Offset.zero : Offset((v[0] as num).toDouble(), (v[1] as num).toDouble());
-    }
-
-    return PageShape(pts('top'), pts('bottom'), j['spread'], leftBow: bow('leftBow'), rightBow: bow('rightBow'));
-  }
+  static PageShape _shapeFrom(ShapeData s) => PageShape(
+        [for (final p in s.top) Offset(p.$1, p.$2)],
+        [for (final p in s.bottom) Offset(p.$1, p.$2)],
+        s.spread,
+        leftBow: Offset(s.leftBow.$1, s.leftBow.$2),
+        rightBow: Offset(s.rightBow.$1, s.rightBow.$2),
+      );
 
   // ── 폴더 ──
 
   /// 문서를 폴더로 옮긴다 (null이면 폴더에서 빼기). 페이지를 읽지 않고 정보만 고친다.
-  static Future<void> setFolder(ScanDoc doc, String? folder) async {
-    await _queues[doc.id];
-    final f = File('${(await _docsDir()).path}/${doc.id}/doc.json');
-    if (!await f.exists()) return;
-    final j = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
-    j['folder'] = folder;
-    await f.writeAsString(jsonEncode(j));
-    doc.folder = folder;
-  }
+  /// 저장 줄에 서고, 같은 순수 함수로 JSON을 만들어 임시 파일로 바꿔치기한다.
+  static Future<void> setFolder(ScanDoc doc, String? folder) => _enqueue(doc.id, () async {
+        final f = File('${(await _docsDir()).path}/${doc.id}/$kDocJson');
+        if (!await f.exists()) return;
+        final data = docFromJson(jsonDecode(await f.readAsString()) as Map<String, dynamic>);
+        await _writeJson(f, withFolder(data, folder));
+        doc.folder = folder;
+      });
 
   // ── 저장 공간 ──
 
@@ -309,50 +311,28 @@ class Store {
 
   /// 원본 사진 줄이기: 촬영 원본을 긴 변 [maxSide]px로 줄여 저장 공간을 아낀다.
   /// 자르기(윤곽 수정)는 계속 되지만 다시 펼 때 화질이 조금 낮아질 수 있다. 줄인 바이트를 돌려준다.
-  static Future<int> shrinkOriginals(ScanDoc doc, {int maxSide = 2000}) async {
-    await _queues[doc.id];
-    final dir = '${(await _docsDir()).path}/${doc.id}';
-    final jf = File('$dir/doc.json');
-    if (!await jf.exists()) return 0;
-    final j = jsonDecode(await jf.readAsString()) as Map<String, dynamic>;
-    final pages = (j['pages'] as List).cast<Map<String, dynamic>>();
-    final scales = <String, double>{}; // 원본 id → 줄인 배율
-    var saved = 0;
-    for (final pj in pages) {
-      final src = pj['src'] as String;
-      if (!scales.containsKey(src)) {
-        final f = File('$dir/src_$src.jpg');
-        final w = (pj['w'] as num).toDouble(), h = (pj['h'] as num).toDouble();
-        final s = maxSide / (w > h ? w : h);
-        if (s >= 0.95 || !await f.exists()) {
-          scales[src] = 1;
-        } else {
-          final before = await f.length();
-          final small = await compute(transcode, (await f.readAsBytes(), 'jpg', maxSide, 85));
-          await f.writeAsBytes(small);
-          saved += before - small.length;
-          scales[src] = s;
+  static Future<int> shrinkOriginals(ScanDoc doc, {int maxSide = 2000}) => _enqueue(doc.id, () async {
+        final dir = '${(await _docsDir()).path}/${doc.id}';
+        final jf = File('$dir/$kDocJson');
+        if (!await jf.exists()) return 0;
+        final data = docFromJson(jsonDecode(await jf.readAsString()) as Map<String, dynamic>);
+        final scales = <String, double>{}; // 원본 id → 줄인 배율
+        var saved = 0;
+        for (final p in data.pages) {
+          if (scales.containsKey(p.src)) continue;
+          final f = File('$dir/${srcFileName(p.src)}');
+          final s = shrinkScale(p.w, p.h, maxSide);
+          if (s == 1 || !await f.exists()) {
+            scales[p.src] = 1;
+          } else {
+            final before = await f.length();
+            final small = await compute(transcode, (await f.readAsBytes(), 'jpg', maxSide, 85));
+            await _writeAtomic(f, small);
+            saved += before - small.length;
+            scales[p.src] = s;
+          }
         }
-      }
-      final s = scales[src]!;
-      if (s == 1) continue;
-      // 원본 좌표로 저장된 윤곽들도 같은 배율로 줄인다
-      pj['w'] = ((pj['w'] as num) * s).round();
-      pj['h'] = ((pj['h'] as num) * s).round();
-      for (final key in ['detShape', 'shape']) {
-        final sh = pj[key] as Map<String, dynamic>;
-        for (final edge in ['top', 'bottom']) {
-          sh[edge] = [
-            for (final pt in sh[edge] as List) [(pt[0] as num) * s, (pt[1] as num) * s],
-          ];
-        }
-        for (final bow in ['leftBow', 'rightBow']) {
-          final v = sh[bow] as List?;
-          if (v != null) sh[bow] = [(v[0] as num) * s, (v[1] as num) * s];
-        }
-      }
-    }
-    await jf.writeAsString(jsonEncode(j));
-    return saved;
-  }
+        await _writeJson(jf, scaledDoc(data, scales));
+        return saved;
+      });
 }

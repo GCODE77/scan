@@ -1,7 +1,7 @@
 # 북스캔 — 세션 핸드오프
 
 - 최종 갱신: 2026-11-02
-- 배포된 최신: **v0.29.0** (https://github.com/GCODE77/scan/releases/latest) — 2026-11-03 배포
+- 배포된 최신: **v0.30.0** (https://github.com/GCODE77/scan/releases/latest) — 2026-11-03 배포
 - 저작권: © 2026 GLORY KIM
 - 저장소: GCODE77/scan (main). 앱은 이 저장소의 최신 릴리스를 확인해 스스로 업데이트한다.
 
@@ -21,6 +21,8 @@
 | `crop_screen.dart` | **윤곽 수정**(점 8개) + 자석(모서리·변) |
 | `scanner.dart` | OpenCV 엔진 전부: 검출, 펴기(`_dewarp`), 필터(`_applyMode`), 자석, 자동 정리, 빛반사, 기울기, 선명도, 긴 사진 |
 | `save_sheet.dart` | 저장 시트(형식 6종 다중 선택, ZIP, 프리셋), `runSave`, PDF/DOCX 생성, 공유 시트 |
+| `store_codec.dart` | **doc.json 직렬화·keep(남길 파일) 계산 순수 함수.** Store의 save/load/setFolder/shrinkOriginals가 모두 이것을 쓴다. **모르는 키는 버리므로 새 필드는 반드시 여기에 먼저 추가**하고 왕복 검사에 견본을 더할 것. 시험: `%TEMP%/claude/store_test` 에서 `sh sync.sh && dart test`(73개, 합성 견본 12종) |
+| `docs_snapshot.dart`·`pre_update_guard.dart` | v0.30.0 첫 실행 보호 복사(docs_before_v030), 앱 정보의 버전 글자 길게 누르기로 되돌리기. 다음 릴리스에서 지울 예정 |
 | `backup_core.dart` | 백업 ZIP 순수 로직(파일 목록, 형식 번호 `bookscan_backup.json` format 1, ID 바꾸기, 경로 탈출 방어). PC 테스트: `%TEMP%/claude/backup_test` 에서 `sh sync.sh && dart test` |
 | `backup.dart` | 백업 만들기·가져오기 화면, Isolate 스트림 ZIP, 채널 `bookscan/backup`(MainActivity.kt: 저장 창 스트림 쓰기, 열기 창 복사, 남은 공간) |
 | `gallery_import.dart` | 갤러리에서 골라 자동 인식까지 한 뒤 페이지 목록 반환(`pickAndScan`) |
@@ -72,7 +74,8 @@
 
 ## 6. 현재 상태와 다음 할 일
 
-- **v0.29.0 (배포 완료)**: 고급 기능 계획(docs/plan.md, 오너 승인 2026-11-16) 1단계 백업·복원. 저장 코드(storage.dart)는 손대지 않음. APK 72,215,535바이트(+1.36MB, 원인 미확인: 빌드 복사본을 새로 만든 뒤 첫 빌드). 다음은 2단계 v0.30.0 저장 구조 정리·왕복 검사(오너의 실제 문서 백업 견본 필요).
+- **v0.30.0 (배포 완료)**: 계획 2단계. 저장 코드 직렬화 분리(동작 변화 없음, 합성 견본 12종 문자열 일치), setFolder·shrinkOriginals도 저장 줄·바꿔치기 쓰기, 첫 실행 보호 복사. 실제 문서 견본 없이 진행(오너 지시). 파일 입출력은 PC 시험 불가, 폰 확인 필요. APK 72,215,535바이트(v0.29.0과 같은 크기, libapp.so 해시는 다름).
+- v0.29.0 (배포 완료): 고급 기능 계획(docs/plan.md, 오너 승인 2026-11-16) 1단계 백업·복원. 저장 코드(storage.dart)는 손대지 않음. APK 72,215,535바이트(+1.36MB, 원인 미확인: 빌드 복사본을 새로 만든 뒤 첫 빌드). 다음은 2단계 v0.30.0 저장 구조 정리·왕복 검사(오너의 실제 문서 백업 견본 필요).
 - v0.28.0 (배포 완료): **저장 시트 예상 용량**(형식 카드·화질 버튼별 합계·선택 합계). `probeSizes`(중간 크기 페이지 1장을 화질 3단계로 실제 인코딩, PNG는 원해상도 조각 3곳으로 어림) + `_SizeEstimate`(페이지별 줄인 뒤 픽셀 수 × 내용 복잡도=원본 JPG 바이트/픽셀로 확장, 크기는 `_jpegSize`로 JPEG 헤더에서 읽음). TXT·DOCX는 OCR 글자로 정확히, PDF는 사진+약 12KB+쪽당 1.5KB(글꼴 부분 내장 실측). `tools/verify_size_estimate.py`로 8페이지 시험: JPG ±3%, PNG −5~−11%. **교훈: 원본 JPG 바이트에만 비례시키면 표준 화질(줄임)에서 +36% 틀린다.**
 - v0.27.0 (배포 완료): **앱 공유하기**(보관함 ⋮ 메뉴·앱 정보 → 소개 문구+받는 링크 `kAppLink`를 공유 창으로, `Updater.shareApp`). 받는 사람이 링크로 APK를 받으려면 저장소가 public이어야 함.
 - v0.26.0 (배포 완료): 윤곽 수정 두 손가락 확대·이동(상대 이동 드래그), 손잡이 크기 축소, 편집 화면 두 손가락 확대(`_ZoomPage`), 배경 제거 보강(ML Kit 모델 다운로드 대기 재시도·읽을 수 있는 오류·**GrabCut 대체 `grabCutMask`**·매니페스트 `DEPENDENCIES`), 독립 코드 검토로 찾은 버그 수정(확대 상태 굳음, rawFlat 불일치, 일괄 작업 중 삭제, 자석 경합, ZIP 안내 불일치 등), 투명 PNG 흰 띠 완화

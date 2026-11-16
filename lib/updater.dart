@@ -8,6 +8,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import 'pre_update_guard.dart';
 import 'theme.dart';
 
 const kCopyright = '© 2026 GLORY KIM. All rights reserved.';
@@ -172,7 +173,7 @@ class Updater {
   }
 
   /// 앱 정보: 버전, 저작권, 업데이트 확인
-  static Future<void> showAbout(BuildContext context) async {
+  static Future<void> showAbout(BuildContext context, {VoidCallback? onDocsChanged}) async {
     final current = await currentVersion();
     if (!context.mounted) return;
     showDialog(
@@ -181,7 +182,14 @@ class Updater {
         icon: const AppLogo(size: 64),
         title: const Text('북스캔'),
         content: Column(mainAxisSize: MainAxisSize.min, children: [
-          Text('버전 v$current', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+          // 숨은 메뉴: 버전 글자를 길게 누르면 업데이트 전 문서로 되돌리기
+          GestureDetector(
+            onLongPress: () async {
+              Navigator.pop(d);
+              if (await PreUpdateGuard.restoreFlow(context)) onDocsChanged?.call();
+            },
+            child: Text('버전 v$current', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+          ),
           const SizedBox(height: 6),
           const Text('책을 스캐너처럼 · 굴곡 펴기 · 한국어·영어 OCR',
               textAlign: TextAlign.center, style: TextStyle(color: AppColors.muted)),

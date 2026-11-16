@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 
 import 'backup.dart';
 import 'document_screen.dart';
+import 'pre_update_guard.dart';
 import 'save_sheet.dart';
 import 'storage.dart';
 import 'theme.dart';
@@ -186,9 +187,15 @@ class _LibraryScreenState extends State<LibraryScreen> {
   @override
   void initState() {
     super.initState();
-    _refresh();
-    // 새 버전이 GitHub에 올라와 있으면 알려 준다
-    WidgetsBinding.instance.addPostFrameCallback((_) => Updater.checkAndPrompt(context));
+    // 첫 실행이면 저장 전에 문서 사본부터 만든다 (끝난 뒤에 목록을 읽는다)
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await PreUpdateGuard.run(context);
+      if (!mounted) return;
+      await _refresh();
+      if (!mounted) return;
+      // 새 버전이 GitHub에 올라와 있으면 알려 준다
+      Updater.checkAndPrompt(context);
+    });
   }
 
   Future<void> _refresh() async {
@@ -363,7 +370,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
               'backup' => Backup.create(context, _docs ?? []),
               'restore' => Backup.restore(context, _refresh),
               'share' => Updater.shareApp(),
-              _ => Updater.showAbout(context),
+              _ => Updater.showAbout(context, onDocsChanged: _refresh),
             },
             itemBuilder: (_) => const [
               PopupMenuItem(
