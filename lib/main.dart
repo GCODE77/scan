@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'backup.dart';
 import 'document_screen.dart';
 import 'save_sheet.dart';
 import 'storage.dart';
@@ -359,6 +360,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
           PopupMenuButton<String>(
             onSelected: (v) => switch (v) {
               'storage' => _storage(),
+              'backup' => Backup.create(context, _docs ?? []),
+              'restore' => Backup.restore(context, _refresh),
               'share' => Updater.shareApp(),
               _ => Updater.showAbout(context),
             },
@@ -366,6 +369,12 @@ class _LibraryScreenState extends State<LibraryScreen> {
               PopupMenuItem(
                   value: 'storage',
                   child: ListTile(leading: Icon(Icons.sd_storage_rounded), title: Text('저장 공간'))),
+              PopupMenuItem(
+                  value: 'backup',
+                  child: ListTile(leading: Icon(Icons.inventory_2_outlined), title: Text('백업 파일 만들기'))),
+              PopupMenuItem(
+                  value: 'restore',
+                  child: ListTile(leading: Icon(Icons.settings_backup_restore_rounded), title: Text('백업 가져오기'))),
               PopupMenuItem(
                   value: 'share',
                   child: ListTile(leading: Icon(Icons.ios_share_rounded), title: Text('앱 공유하기'))),
@@ -444,7 +453,17 @@ class _LibraryScreenState extends State<LibraryScreen> {
                       label: const Text('폴더로'),
                     ),
                   ),
-                  const SizedBox(width: 12),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: _selected.isEmpty
+                          ? null
+                          : () => Backup.create(context, _docs!.where((d) => _selected.contains(d.id)).toList()),
+                      icon: const Icon(Icons.inventory_2_outlined),
+                      label: const Text('백업'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
                   Expanded(
                     flex: 2,
                     child: FilledButton.icon(
